@@ -81,6 +81,7 @@ pub struct RateLimitExceeded {
     pub limit: u32,
 }
 
+/// Provides bounded sliding-window checks for string and numeric caller keys.
 impl RateLimiter {
     /// Create a new limiter with the given base rate and burst allowance.
     ///
@@ -253,6 +254,65 @@ impl RateLimiter {
         }
     }
 
+    /// Returns the active numeric-key retry delay without recording an attempt.
+    ///
+    /// A poisoned lock or a full live key table returns a delay and therefore
+    /// fails closed. Expired entries are pruned exactly as they are in `check`.
+    pub fn retry_after(&self, key_id: i64, limit: u32) -> Option<u64> {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        let max_requests = limit + self.burst;
+        let key = key_id.to_string();
+        let mut map = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("rate limiter lock poisoned; failing closed");
+                return Some(1);
+            }
+        };
+
+        if !has_room_for_key(&mut map, &key, now, window, self.max_keys) {
+            tracing::warn!(
+                max_keys = self.max_keys,
+                "rate limiter key table full; denying new key fail-closed"
+            );
+            return Some(window.as_secs().max(1));
+        }
+
+        if max_requests == 0 {
+            return Some(window.as_secs());
+        }
+
+        let deque = map.get_mut(&key)?;
+        while let Some(&front) = deque.front() {
+            if now.duration_since(front) > window {
+                deque.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if deque.is_empty() {
+            map.remove(&key);
+            return None;
+        }
+
+        if deque.len() as u32 >= max_requests {
+            let retry_after_secs = deque
+                .front()
+                .map(|oldest| {
+                    window
+                        .saturating_sub(now.duration_since(*oldest))
+                        .as_secs()
+                        .max(1)
+                })
+                .unwrap_or_else(|| window.as_secs());
+            Some(retry_after_secs)
+        } else {
+            None
+        }
+    }
+
     /// Prune all expired entries across all keys to bound memory growth.
     pub fn prune(&self) {
         let now = Instant::now();
@@ -276,7 +336,9 @@ impl RateLimiter {
     }
 }
 
+/// Constructs the standard sixty-request limiter when no policy is supplied.
 impl Default for RateLimiter {
+    /// Returns the default in-memory limiter configuration.
     fn default() -> Self {
         Self::new()
     }
@@ -461,6 +523,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Allows numeric-key attempts that remain below the configured limit.
     fn test_rate_limiter_allows_within_limit() {
         let rl = RateLimiter::new();
         for _ in 0..5 {
@@ -469,6 +532,7 @@ mod tests {
     }
 
     #[test]
+    /// Rejects the first numeric-key attempt beyond the configured limit.
     fn test_rate_limiter_blocks_over_limit() {
         let rl = RateLimiter::new();
         for _ in 0..10 {
@@ -479,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    /// Maintains independent request windows for distinct numeric keys.
     fn test_rate_limiter_separate_keys() {
         let rl = RateLimiter::new();
         for _ in 0..10 {
@@ -486,6 +551,19 @@ mod tests {
         }
         // Key 2 should still be allowed
         assert!(rl.check(2, 10).is_ok());
+    }
+
+    /// A non-recording probe changes state only by pruning expired entries.
+    #[test]
+    fn test_retry_after_does_not_consume_capacity() {
+        let rl = RateLimiter::new();
+        for _ in 0..10 {
+            assert_eq!(rl.retry_after(1, 10), None);
+        }
+        for _ in 0..10 {
+            assert!(rl.check(1, 10).is_ok());
+        }
+        assert!(rl.retry_after(1, 10).is_some());
     }
 
     /// H-R3-003: zero-limit must return Err gracefully, not panic.
