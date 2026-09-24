@@ -609,7 +609,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
-            socket.read(&mut request).await.unwrap();
+            let _bytes_read = socket.read(&mut request).await.unwrap();
             let response = format!("HTTP/1.1 207 Multi-Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
             socket.write_all(response.as_bytes()).await.unwrap();
         });
