@@ -9,6 +9,7 @@
 export class EngramError extends Error {
     statusCode;
     response;
+    /** Retain status and complete response details so callers can recover partial writes. */
     constructor(message, statusCode, response) {
         super(message);
         this.statusCode = statusCode;

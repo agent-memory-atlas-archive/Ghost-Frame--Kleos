@@ -33,6 +33,7 @@ export class EngramClient {
     baseUrl;
     apiKey;
     timeout;
+    /** Normalize the server URL and retain authentication and timeout settings. */
     constructor(config) {
         this.baseUrl = config.url.replace(/\/$/, ''); // Remove trailing slash
         this.apiKey = config.apiKey;
@@ -57,7 +58,7 @@ export class EngramClient {
                 signal: controller.signal,
             });
             clearTimeout(timeoutId);
-            if (!response.ok) {
+            if (!response.ok || response.status === 207) {
                 let errorBody;
                 try {
                     errorBody = await response.json();
@@ -65,7 +66,9 @@ export class EngramClient {
                 catch {
                     // Response body wasn't JSON
                 }
-                throw new EngramError(errorBody?.error ?? `HTTP ${response.status}`, response.status, errorBody);
+                throw new EngramError(response.status === 207
+                    ? `Partial persistence (HTTP 207): ${errorBody?.error ?? 'inspect the response before retrying'}`
+                    : errorBody?.error ?? `HTTP ${response.status}`, response.status, errorBody);
             }
             return await response.json();
         }

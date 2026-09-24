@@ -4,7 +4,7 @@
  * Type definitions matching the engram-server API.
  */
 
-// Memory categories
+/** Supported memory categories. */
 export type MemoryCategory =
   | 'task'
   | 'discovery'
@@ -14,7 +14,7 @@ export type MemoryCategory =
   | 'general'
   | 'reference';
 
-// Question types for search optimization
+/** Question types for search optimization. */
 export type QuestionType =
   | 'fact_recall'
   | 'preference'
@@ -22,10 +22,10 @@ export type QuestionType =
   | 'generalization'
   | 'temporal';
 
-// Search modes
+/** Retrieval engines available to search requests. */
 export type SearchMode = 'hybrid' | 'vector' | 'fts';
 
-// Memory status
+/** Review status of a stored memory. */
 export type MemoryStatus = 'approved' | 'pending';
 
 /**
@@ -192,7 +192,9 @@ export interface UpdateRequest {
 
 // Context assembly types
 
+/** Ranking strategy used to assemble memory context. */
 export type ContextStrategy = 'semantic' | 'temporal' | 'importance' | 'mixed';
+/** Breadth of memory context to assemble for a request. */
 export type ContextMode = 'default' | 'focused' | 'broad';
 
 /**
@@ -247,12 +249,15 @@ export interface EngramClientConfig {
  */
 export interface ApiError {
   error: string;
+  /** Preserve partial results, including persisted IDs and attachment state. */
+  [key: string]: unknown;
 }
 
 /**
  * Custom error class for Engram API errors.
  */
 export class EngramError extends Error {
+  /** Retain status and complete response details so callers can recover partial writes. */
   constructor(
     message: string,
     public statusCode: number,
