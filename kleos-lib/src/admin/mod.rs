@@ -494,110 +494,235 @@ pub async fn export_user_data(db: &Database, user_id: i64) -> Result<UserExport>
     // Every table here carries user_id in both the monolith and tenant-shard
     // schemas, so the predicate is a no-op in a single-owner shard and the
     // tenant boundary in shared (monolith) mode where this runs on state.db.
-    let memories = export_table_user(
-        db,
-        "SELECT id, content, category, source, importance, tags, \
-         created_at, updated_at, space_id, is_archived \
-         FROM memories WHERE is_forgotten = 0 AND user_id = ?1 \
+    let exported_at = Utc::now().to_rfc3339();
+    db.transaction(move |tx| {
+        let memories = export_table_user(
+            tx,
+            "SELECT id, content, category, source, importance, tags, \
+         session_id, version, source_count, is_static, model, confidence, status, \
+         created_at, updated_at, is_archived \
+         FROM memories WHERE is_forgotten = 0 AND is_latest = 1 AND user_id = ?1 \
          ORDER BY created_at DESC",
-        user_id,
-    )
-    .await?;
-    let conversations = export_table_user(
-        db,
-        "SELECT id, session_id, agent, title, metadata, started_at, updated_at \
+            user_id,
+        )?;
+        let conversations = export_table_user(
+            tx,
+            "SELECT id, session_id, agent, title, metadata, started_at, updated_at \
          FROM conversations WHERE user_id = ?1 ORDER BY started_at DESC",
-        user_id,
-    )
-    .await?;
-    let episodes = export_table_user(
-        db,
-        "SELECT id, title, summary, session_id, created_at \
+            user_id,
+        )?;
+        let episodes = export_table_user(
+            tx,
+            "SELECT id, title, summary, session_id, agent, memory_count, duration_seconds, \
+         started_at, ended_at, created_at \
          FROM episodes WHERE user_id = ?1 ORDER BY created_at DESC",
-        user_id,
-    )
-    .await?;
-    let entities = export_table_user(
-        db,
-        "SELECT id, name, entity_type, description, metadata, created_at \
+            user_id,
+        )?;
+        let entities = export_table_user(
+            tx,
+            "SELECT id, name, entity_type, description, aliases, aka, metadata, confidence, \
+         occurrence_count, first_seen_at, last_seen_at, created_at, updated_at \
          FROM entities WHERE user_id = ?1 ORDER BY name",
-        user_id,
-    )
-    .await?;
-    let facts = export_table_user(
-        db,
-        "SELECT id, memory_id, subject, predicate, object, confidence, created_at \
-         FROM structured_facts \
-         WHERE user_id = ?1 ORDER BY created_at DESC",
-        user_id,
-    )
-    .await?;
-    let preferences = export_table_user(
-        db,
-        "SELECT id, key, value, created_at, updated_at \
-         FROM user_preferences WHERE user_id = ?1 ORDER BY key",
-        user_id,
-    )
-    .await?;
-    // The real table is `skill_records`; there is no `skills` table in any
-    // schema, so the old query 500'd in sharded mode. `skill_records` has no
-    // `tags` column, so it is dropped from the projection; every remaining
-    // column exists in both the monolith and tenant-shard schemas. The
-    // `user_id` predicate scopes the export to the caller (a no-op in a
-    // single-owner shard, the tenant boundary in monolith).
-    let skills = export_table_user(
-        db,
-        "SELECT id, name, description, content, language, created_at \
+            user_id,
+        )?;
+        let facts = export_table_user(
+            tx,
+        "SELECT f.id, f.memory_id, f.subject, f.predicate, f.object, f.verb, f.quantity, f.unit, \
+         f.date_ref, f.date_approx, f.location, f.context, f.valid_at, f.invalid_at, \
+         f.confidence, f.created_at \
+         FROM structured_facts f LEFT JOIN memories m ON m.id = f.memory_id \
+         WHERE f.user_id = ?1 AND (f.memory_id IS NULL OR \
+               (m.user_id = ?1 AND m.is_latest = 1 AND m.is_forgotten = 0)) \
+         ORDER BY f.created_at DESC",
+            user_id,
+        )?;
+        let preferences = export_table_user(
+            tx,
+            "SELECT p.id, p.key, p.value, p.domain, p.preference, p.strength, \
+         CASE WHEN p.evidence_memory_id IS NULL OR EXISTS( \
+             SELECT 1 FROM memories m WHERE m.id = p.evidence_memory_id AND m.user_id = ?1 \
+             AND m.is_latest = 1 AND m.is_forgotten = 0) \
+         THEN p.evidence_memory_id ELSE NULL END AS evidence_memory_id, \
+         p.created_at, p.updated_at \
+         FROM user_preferences p WHERE p.user_id = ?1 ORDER BY p.key",
+            user_id,
+        )?;
+        // The real table is `skill_records`; there is no `skills` table in any
+        // schema, so the old query 500'd in sharded mode. `skill_records` has no
+        // `tags` column, so it is dropped from the projection; every remaining
+        // column exists in both the monolith and tenant-shard schemas. The
+        // `user_id` predicate scopes the export to the caller (a no-op in a
+        // single-owner shard, the tenant boundary in monolith).
+        let skills = export_table_user(
+            tx,
+            "SELECT id, skill_id, name, agent, description, code, content, category, origin, \
+         generation, language, version, trust_score, is_active, is_deprecated, visibility, \
+         metadata, created_at, updated_at \
          FROM skill_records WHERE user_id = ?1 ORDER BY name",
-        user_id,
-    )
-    .await?;
-    Ok(UserExport {
-        version: "1.0".to_string(),
-        exported_at: Utc::now().to_rfc3339(),
-        user_id,
-        memories,
-        conversations,
-        episodes,
-        entities,
-        facts,
-        preferences,
-        skills,
+            user_id,
+        )?;
+        Ok(UserExport {
+            version: "2.0".to_string(),
+            exported_at,
+            user_id,
+            memories,
+            conversations,
+            episodes,
+            entities,
+            facts,
+            preferences,
+            skills,
+        })
     })
+    .await
+}
+
+/// Stream a version 2 logical export from one read transaction through a
+/// bounded channel. A dropped receiver stops row production and releases the
+/// snapshot instead of continuing to buffer an abandoned export.
+pub async fn stream_user_data_ndjson(
+    db: &Database,
+    user_id: i64,
+    sender: tokio::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    let exported_at = Utc::now().to_rfc3339();
+    db.read(move |conn| {
+        let tx = conn.unchecked_transaction()?;
+        sender
+            .blocking_send(
+                serde_json::json!({
+                    "type": "header",
+                    "version": "2.0",
+                    "exported_at": exported_at,
+                    "user_id": user_id,
+                })
+                .to_string()
+                    + "\n",
+            )
+            .map_err(|_| crate::EngError::Internal("export receiver closed".into()))?;
+        let sections = [
+            (
+                "memory",
+                "SELECT id, content, category, source, importance, tags, session_id, version, \
+                 source_count, is_static, model, confidence, status, created_at, updated_at, \
+                 is_archived FROM memories WHERE is_forgotten = 0 AND is_latest = 1 \
+                 AND user_id = ?1 ORDER BY created_at DESC",
+            ),
+            (
+                "conversation",
+                "SELECT id, session_id, agent, title, metadata, started_at, updated_at \
+                 FROM conversations WHERE user_id = ?1 ORDER BY started_at DESC",
+            ),
+            (
+                "episode",
+                "SELECT id, title, summary, session_id, agent, memory_count, duration_seconds, \
+                 started_at, ended_at, created_at FROM episodes WHERE user_id = ?1 \
+                 ORDER BY created_at DESC",
+            ),
+            (
+                "entity",
+                "SELECT id, name, entity_type, description, aliases, aka, metadata, confidence, \
+                 occurrence_count, first_seen_at, last_seen_at, created_at, updated_at \
+                 FROM entities WHERE user_id = ?1 ORDER BY name",
+            ),
+            (
+                "fact",
+                "SELECT f.id, f.memory_id, f.subject, f.predicate, f.object, f.verb, f.quantity, \
+                 f.unit, f.date_ref, f.date_approx, f.location, f.context, f.valid_at, \
+                 f.invalid_at, f.confidence, f.created_at FROM structured_facts f \
+                 LEFT JOIN memories m ON m.id = f.memory_id WHERE f.user_id = ?1 AND \
+                 (f.memory_id IS NULL OR (m.user_id = ?1 AND m.is_latest = 1 \
+                 AND m.is_forgotten = 0)) \
+                 ORDER BY f.created_at DESC",
+            ),
+            (
+                "preference",
+                "SELECT p.id, p.key, p.value, p.domain, p.preference, p.strength, \
+                 CASE WHEN p.evidence_memory_id IS NULL OR EXISTS(SELECT 1 FROM memories m \
+                 WHERE m.id = p.evidence_memory_id AND m.user_id = ?1 AND m.is_latest = 1 \
+                 AND m.is_forgotten = 0) \
+                 THEN p.evidence_memory_id ELSE NULL END AS evidence_memory_id, p.created_at, \
+                 p.updated_at FROM user_preferences p WHERE p.user_id = ?1 ORDER BY p.key",
+            ),
+            (
+                "skill",
+                "SELECT id, skill_id, name, agent, description, code, content, category, origin, \
+                 generation, language, version, trust_score, is_active, is_deprecated, \
+                 visibility, metadata, created_at, updated_at FROM skill_records \
+                 WHERE user_id = ?1 ORDER BY name",
+            ),
+        ];
+        let mut counts = serde_json::Map::new();
+        for (record_type, sql) in sections {
+            let mut count = 0u64;
+            export_table_user_each(&tx, sql, user_id, |mut record| {
+                record
+                    .as_object_mut()
+                    .expect("database rows serialize as objects")
+                    .insert("type".into(), record_type.into());
+                sender
+                    .blocking_send(record.to_string() + "\n")
+                    .map_err(|_| crate::EngError::Internal("export receiver closed".into()))?;
+                count = count.checked_add(1).ok_or_else(|| {
+                    crate::EngError::Internal("export record count overflow".into())
+                })?;
+                Ok(())
+            })?;
+            counts.insert(record_type.to_string(), count.into());
+        }
+        sender
+            .blocking_send(
+                serde_json::json!({ "type": "trailer", "counts": counts }).to_string() + "\n",
+            )
+            .map_err(|_| crate::EngError::Internal("export receiver closed".into()))?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
 }
 
 /// Serialize all rows of one user-scoped table into the export blob format used by /admin/export.
-async fn export_table_user(
-    db: &Database,
+fn export_table_user(
+    conn: &rusqlite::Connection,
     sql: &str,
     user_id: i64,
 ) -> Result<Vec<serde_json::Value>> {
-    let sql_owned = sql.to_string();
-    db.read(move |conn| {
-        let mut stmt = conn.prepare(&sql_owned)?;
-        // Capture the real column names before stepping rows: `column_name`
-        // borrows the statement, so collect owned strings up front, then take
-        // the `&mut` borrow that `query` needs. These names become the JSON
-        // keys so the export round-trips through the named-key import reader.
-        let column_names: Vec<String> = (0..stmt.column_count())
-            .map(|i| stmt.column_name(i).map(str::to_string))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut rows = stmt.query(params![user_id])?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next()? {
-            let mut obj = serde_json::Map::new();
-            // Serialize every column by its real SQLite type. The old path read
-            // each cell as `String` and broke on the first non-text column (the
-            // integer `id` at column 0), which emptied every export array. No
-            // row is dropped now: a NULL becomes JSON null, not a missing key.
-            for (i, name) in column_names.iter().enumerate() {
-                obj.insert(name.clone(), sqlite_value_to_json(row.get_ref(i)?));
-            }
-            result.push(serde_json::Value::Object(obj));
+    let mut result = Vec::new();
+    export_table_user_each(conn, sql, user_id, |row| {
+        result.push(row);
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+/// Serialize rows one at a time so streaming callers do not retain a table.
+fn export_table_user_each(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    user_id: i64,
+    mut emit: impl FnMut(serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    // Capture the real column names before stepping rows: `column_name`
+    // borrows the statement, so collect owned strings up front, then take
+    // the `&mut` borrow that `query` needs. These names become the JSON
+    // keys so the export round-trips through the named-key import reader.
+    let column_names: Vec<String> = (0..stmt.column_count())
+        .map(|i| stmt.column_name(i).map(str::to_string))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rows = stmt.query(params![user_id])?;
+    while let Some(row) = rows.next()? {
+        let mut obj = serde_json::Map::new();
+        // Serialize every column by its real SQLite type. The old path read
+        // each cell as `String` and broke on the first non-text column (the
+        // integer `id` at column 0), which emptied every export array. No
+        // row is dropped now: a NULL becomes JSON null, not a missing key.
+        for (i, name) in column_names.iter().enumerate() {
+            obj.insert(name.clone(), sqlite_value_to_json(row.get_ref(i)?));
         }
-        Ok(result)
-    })
-    .await
+        emit(serde_json::Value::Object(obj))?;
+    }
+    Ok(())
 }
 
 /// Convert one SQLite cell into its `serde_json::Value` equivalent, preserving
@@ -919,6 +1044,7 @@ pub async fn get_stats(db: &Database) -> Result<serde_json::Value> {
 }
 
 #[cfg(test)]
+/// Covers administrative export and deprovisioning behavior.
 mod tests {
     use super::*;
     use crate::db::Database;
@@ -979,13 +1105,16 @@ mod tests {
         .await
         .expect("seed memory");
 
-        let rows = export_table_user(
-            &db,
-            "SELECT id, content FROM memories WHERE user_id = ?1 ORDER BY id",
-            1,
-        )
-        .await
-        .expect("export rows");
+        let rows = db
+            .read(|conn| {
+                export_table_user(
+                    conn,
+                    "SELECT id, content FROM memories WHERE user_id = ?1 ORDER BY id",
+                    1,
+                )
+            })
+            .await
+            .expect("export rows");
 
         assert_eq!(rows.len(), 1, "the seeded row must not be dropped");
         let obj = rows[0].as_object().expect("row is a json object");
@@ -1019,13 +1148,16 @@ mod tests {
         .await
         .expect("seed memory");
 
-        let rows = export_table_user(
-            &db,
-            "SELECT id, session_id, content FROM memories WHERE user_id = ?1",
-            1,
-        )
-        .await
-        .expect("export rows");
+        let rows = db
+            .read(|conn| {
+                export_table_user(
+                    conn,
+                    "SELECT id, session_id, content FROM memories WHERE user_id = ?1",
+                    1,
+                )
+            })
+            .await
+            .expect("export rows");
 
         assert_eq!(rows.len(), 1);
         let obj = rows[0].as_object().expect("row is a json object");
@@ -1037,6 +1169,51 @@ mod tests {
             obj.get("session_id").map(|v| v.is_null()).unwrap_or(false),
             "null column must serialize to json null",
         );
+    }
+
+    /// Dropping a bounded export receiver cancels row production and releases
+    /// its read snapshot so later database work is not stranded. This test is
+    /// confined to a new process-local in-memory fixture.
+    #[tokio::test]
+    async fn streaming_export_cancels_when_receiver_is_dropped() {
+        let db = std::sync::Arc::new(Database::connect_memory().await.expect("memory db"));
+        db.write(|conn| {
+            for index in 0..8 {
+                conn.execute(
+                    "INSERT INTO memories (content, category, importance, user_id) \
+                     VALUES (?1, 'test', 5, 1)",
+                    [format!("synthetic stream row {index}")],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("populate isolated fixture");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let export_db = db.clone();
+        let task =
+            tokio::spawn(async move { stream_user_data_ndjson(&export_db, 1, sender).await });
+        let header = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("header timeout")
+            .expect("header");
+        assert!(header.contains("\"type\":\"header\""));
+        drop(receiver);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cancelled producer must finish")
+            .expect("producer task");
+        assert!(result.is_err(), "closed receiver must cancel production");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            db.write(|conn| {
+                let _: i64 = conn.query_row("SELECT 1", [], |row| row.get(0))?;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("database released after cancellation")
+        .expect("database remains usable");
     }
 
     /// F28: deprovisioning the reserved owner account (user_id=1) must be refused

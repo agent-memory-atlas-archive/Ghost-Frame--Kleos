@@ -232,10 +232,9 @@ pub fn build_router(state: AppState) -> Router {
     // Metrics endpoint is unauthenticated (for Prometheus scraping)
     let metrics_routes = crate::middleware::metrics::router();
 
-    // Public routes served without auth -- the MCP schema endpoint lets
-    // external proxies discover tool definitions at startup. The broca
-    // ingest endpoint is also public: it receives Axon webhooks and is
-    // protected at the network layer rather than with bearer tokens.
+    // Public routes served without auth. The MCP schema endpoint lets external
+    // proxies discover tool definitions at startup, and the Broca dashboard is
+    // a static shell whose data requests still use authenticated API routes.
     let public_routes = routes::mcp_schema::public_router().merge(routes::broca::ingest_router());
 
     Router::new()
