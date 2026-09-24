@@ -28,17 +28,17 @@ use kleos_lib::auth::{AuthContext, Scope};
 use kleos_lib::spaces::{self, InstanceAccess};
 use serde_json::json;
 
+use crate::middleware::auth::is_read_only_post;
 use crate::state::AppState;
 
 /// HTTP header naming the act-as target owner for delegated shard access.
 pub const ACT_AS_HEADER: &str = "x-kleos-act-as";
 
-/// Map an HTTP method to the minimum grant level it requires: a read for safe
-/// methods, a write for mutating ones. This collapses SD1 (read isolation) and
-/// SD3 (write gating) into one decision at the chokepoint.
-fn min_access_for_method(method: &Method) -> InstanceAccess {
+/// Map transport method and path to the logical delegation access required.
+fn min_access_for_request(method: &Method, path: &str) -> InstanceAccess {
     match *method {
         Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE => InstanceAccess::Read,
+        Method::POST if is_read_only_post(path) => InstanceAccess::Read,
         _ => InstanceAccess::Write,
     }
 }
@@ -49,6 +49,7 @@ fn deny(status: StatusCode, message: &str) -> Response {
 }
 
 #[tracing::instrument(skip_all, fields(middleware = "server.act_as"))]
+/// Resolves delegation headers and records the effective owner context.
 pub async fn act_as_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -90,9 +91,11 @@ pub async fn act_as_middleware(
     }
 
     // Authorize the delegation. Admin is god-mode (SD4) and short-circuits the
-    // grant lookup; otherwise a grant must cover the method's access need.
-    if !auth.has_scope(&Scope::Admin) {
-        let min_access = min_access_for_method(request.method());
+    // grant lookup; otherwise a grant must cover the logical operation.
+    let min_access = min_access_for_request(request.method(), request.uri().path());
+    let granted_access = if auth.has_scope(&Scope::Admin) {
+        InstanceAccess::Write
+    } else {
         let granted =
             match spaces::lookup_instance_grant(&state.db, target_owner, auth.user_id).await {
                 Ok(g) => g,
@@ -103,14 +106,14 @@ pub async fn act_as_middleware(
                     );
                 }
             };
-        let authorized = granted.map(|a| a.satisfies(min_access)).unwrap_or(false);
-        if !authorized {
+        let Some(granted) = granted.filter(|access| access.satisfies(min_access)) else {
             return deny(
                 StatusCode::FORBIDDEN,
                 "no grant authorizes acting as the requested owner",
             );
-        }
-    }
+        };
+        granted
+    };
 
     // SD5: record the delegated resolution for forensic accountability.
     // Fire-and-forget so the request is not gated on the audit write; the real
@@ -119,7 +122,7 @@ pub async fn act_as_middleware(
         let db = state.db.clone();
         let actor = auth.user_id;
         let owner = target_owner;
-        let access = min_access_for_method(request.method()).as_str();
+        let access = min_access.as_str();
         tokio::spawn(async move {
             let _ = kleos_lib::audit::log_mutation(
                 &db,
@@ -139,6 +142,7 @@ pub async fn act_as_middleware(
     // operations follow it via effective_user_id(). user_id stays the caller.
     let mut delegated = auth;
     delegated.act_as = Some(target_owner);
+    delegated.act_as_access = Some(granted_access);
     request.extensions_mut().insert(delegated);
 
     next.run(request).await

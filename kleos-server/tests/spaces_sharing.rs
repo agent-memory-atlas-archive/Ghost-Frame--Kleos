@@ -13,9 +13,11 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use common::{
-    bootstrap_admin_key, get, get_as, get_as_raw, post, post_as, seed_user, test_app_with_sharding,
+    bootstrap_admin_key, get, get_as, get_as_raw, post, post_as, seed_user, send,
+    test_app_with_sharding,
 };
 use serde_json::json;
 
@@ -44,6 +46,71 @@ fn project_names(body: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Send an MCP JSON-RPC payload while acting inside another owner's shard.
+async fn mcp_as(
+    app: &axum::Router,
+    key: &str,
+    owner: i64,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .header(common::ACT_AS_HEADER, owner.to_string())
+        .body(Body::from(payload.to_string()))
+        .expect("MCP act-as request");
+    send(app, request).await
+}
+
+/// Read delegation permits read-only MCP tools, rejects writes per tool, and
+/// an unrelated owner remains inaccessible at the outer delegation boundary.
+#[tokio::test]
+async fn read_grant_is_enforced_per_mcp_tool() {
+    let (app, _state, _tmp) = test_app_with_sharding().await;
+    let admin = bootstrap_admin_key(&app).await;
+    let (alice_uid, alice_key) = seed_user(&app, &admin, "mcp-owner").await;
+    let (bob_uid, bob_key) = seed_user(&app, &admin, "mcp-reader").await;
+    let (carol_uid, _carol_key) = seed_user(&app, &admin, "mcp-unshared-owner").await;
+
+    let (status, body) = post(
+        &app,
+        "/store",
+        &alice_key,
+        json!({"content":"delegated MCP search target","category":"test"}),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (status, body) = post(
+        &app,
+        "/instance-grants",
+        &admin,
+        json!({"owner_user_id":alice_uid,"grantee_user_id":bob_uid,"access":"read"}),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+
+    let batch = json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"delegated MCP search target"}}},
+        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"content":"blocked delegated write"}}}
+    ]);
+    let (status, body) = mcp_as(&app, &bob_key, alice_uid, batch.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let responses = body.as_array().expect("batch response");
+    assert_eq!(responses[0]["result"]["isError"], false, "{body}");
+    assert_eq!(responses[1]["result"]["isError"], true, "{body}");
+    assert!(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("insufficient delegated access")),
+        "{body}"
+    );
+
+    let (status, _) = mcp_as(&app, &bob_key, carol_uid, batch).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// SD1a: a grantee holding a read grant can read the owner's data by acting as

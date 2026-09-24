@@ -26,7 +26,7 @@ use tower::ServiceExt;
 use kleos_server::server::build_router;
 use kleos_server::state::AppState;
 
-use common::{body_json, bootstrap_admin_key};
+use common::{body_json, bootstrap_admin_key, post};
 
 /// Build a monolith test app with the GUI enabled so the cookie-login flow works.
 async fn gui_app() -> axum::Router {
@@ -239,6 +239,66 @@ async fn gui_cookie_with_valid_csrf_can_write() {
         "cookie + valid CSRF must authorize a write, got {}",
         res.status()
     );
+}
+
+#[tokio::test]
+/// MCP remains a transport-level POST and rejects cookie auth without CSRF.
+async fn gui_cookie_mcp_post_without_csrf_is_rejected() {
+    let app = gui_app().await;
+    let admin = bootstrap_admin_key(&app).await;
+    let (cookie, _csrf) = gui_login_full(&app, &admin).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Cookie", &cookie)
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+/// A read-only GUI session may use MCP reads when the POST carries valid CSRF.
+async fn gui_read_cookie_mcp_post_with_csrf_is_allowed() {
+    let app = gui_app().await;
+    let admin = bootstrap_admin_key(&app).await;
+    let (status, body) = post(
+        &app,
+        "/keys",
+        &admin,
+        json!({"name":"gui-read","scopes":"read","user_id":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let read_key = body["key"].as_str().expect("read key");
+    let (cookie, csrf) = gui_login_full(&app, read_key).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Cookie", &cookie)
+                .header("X-CSRF-Token", csrf)
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use kleos_client::{render_path, resolve_tool_name, Method, Scope as RouteScope};
 use kleos_lib::auth::{AuthContext, Scope};
+use kleos_lib::spaces::InstanceAccess;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -336,6 +337,21 @@ async fn dispatch_tool(
         ));
     }
 
+    // The outer POST /mcp transport is logically read-capable, so delegated
+    // access must be checked against each actual tool before internal dispatch.
+    if auth.act_as.is_some() {
+        let required_access = route_scope_to_instance_access(route.scope);
+        let delegated = auth
+            .act_as_access
+            .ok_or_else(|| "delegated MCP request is missing its grant context".to_string())?;
+        if !delegated.satisfies(required_access) {
+            return Err(format!(
+                "insufficient delegated access: tool '{name}' requires {}",
+                required_access.as_str()
+            ));
+        }
+    }
+
     let path = render_path(route.path, &mut args)?;
 
     // Build URI: for GET/DELETE, remaining args become query parameters.
@@ -389,6 +405,26 @@ async fn dispatch_tool(
 
     let parsed: Result<Value, _> = serde_json::from_slice(&body_bytes);
     if status.is_success() {
+        if status == StatusCode::MULTI_STATUS {
+            let body = parsed
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|_| String::from_utf8_lossy(&body_bytes).into_owned());
+            return Err(format!(
+                "tool '{}' returned a partial result requiring caller recovery: {}",
+                name, body
+            ));
+        }
+        if let Some(body) = parsed
+            .as_ref()
+            .ok()
+            .filter(|body| body.get("attachments_committed") == Some(&Value::Bool(false)))
+        {
+            return Err(format!(
+                "tool '{}' partially persisted its memory but did not commit attachments: {}",
+                name, body
+            ));
+        }
         parsed.or_else(|_| {
             let text = String::from_utf8_lossy(&body_bytes).into_owned();
             Ok(json!({ "content": text }))
@@ -429,6 +465,14 @@ fn route_scope_to_auth_scope(scope: RouteScope) -> Scope {
         RouteScope::Read => Scope::Read,
         RouteScope::Write => Scope::Write,
         RouteScope::Admin => Scope::Admin,
+    }
+}
+
+/// Converts a route-registry scope to the whole-instance delegation level.
+fn route_scope_to_instance_access(scope: RouteScope) -> InstanceAccess {
+    match scope {
+        RouteScope::Read => InstanceAccess::Read,
+        RouteScope::Write | RouteScope::Admin => InstanceAccess::Write,
     }
 }
 

@@ -7,7 +7,7 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{bootstrap_admin_key, send, test_app};
+use common::{bootstrap_admin_key, post, send, test_app, test_app_with_sharding};
 use ed25519_dalek::SigningKey;
 use kleos_lib::auth_piv::RequestSigner;
 use kleos_lib::mcp_token;
@@ -109,7 +109,90 @@ async fn register_token(
     send(app, req).await
 }
 
+/// Send one JSON-RPC payload through the MCP HTTP transport.
+async fn mcp_request(
+    app: &axum::Router,
+    token: &str,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("MCP request");
+    send(app, request).await
+}
+
 // --- Tests ---
+
+/// A read-scoped direct-auth token can use MCP read operations while each
+/// mutating tool, including one inside a mixed batch, is denied independently.
+#[tokio::test]
+async fn read_token_mcp_transport_enforces_each_tool_scope() {
+    let (app, _state, _tmp) = test_app_with_sharding().await;
+    let admin_key = bootstrap_admin_key(&app).await;
+    let (status, body) = post(
+        &app,
+        "/keys",
+        &admin_key,
+        json!({"name":"classifier-read-key","scopes":"read","user_id":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let read_api_key = body["key"].as_str().expect("read API key").to_string();
+    let signer = enroll_soft_key(&app).await;
+    let (token, _) = mint_token(&signer, "read", 3600);
+    let (status, body) = register_token(&app, &signer, &token, "read-mcp", "read", 3600).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    for payload in [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    ] {
+        let (status, body) = mcp_request(&app, &token, payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("result").is_some(), "{body}");
+    }
+
+    let unknown_request = Request::builder()
+        .method("POST")
+        .uri("/not-a-logical-read")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from("{}"))
+        .expect("unknown POST request");
+    let (status, _) = send(&app, unknown_request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let matched_write = Request::builder()
+        .method("POST")
+        .uri("/projects")
+        .header("Authorization", format!("Bearer {read_api_key}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from("{}"))
+        .expect("matched write request");
+    let (status, _) = send(&app, matched_write).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let mixed = json!([
+        {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_list","arguments":{}}},
+        {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_store","arguments":{"content":"must not persist"}}}
+    ]);
+    let (status, body) = mcp_request(&app, &token, mixed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let responses = body.as_array().expect("batch response");
+    assert_eq!(responses.len(), 2, "{body}");
+    assert_eq!(responses[0]["result"]["isError"], false, "{body}");
+    assert_eq!(responses[1]["result"]["isError"], true, "{body}");
+    assert!(
+        responses[1]["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("insufficient scope")),
+        "{body}"
+    );
+}
 
 /// Full flow: enroll key -> mint token -> register -> use as bearer.
 #[tokio::test]

@@ -27,6 +27,7 @@ const OPEN_PATHS: &[&str] = &[
 
 const MAX_AUTH_BODY_BUFFER: usize = 2 * 1024 * 1024;
 
+/// Returns whether an HTTP method normally requires write authorization.
 fn requires_write_scope(method: &Method) -> bool {
     matches!(
         method,
@@ -34,7 +35,8 @@ fn requires_write_scope(method: &Method) -> bool {
     )
 }
 
-fn is_read_only_post(path: &str) -> bool {
+/// Return whether a POST path performs a known logical read operation.
+pub(crate) fn is_read_only_post(path: &str) -> bool {
     matches!(
         path,
         "/search"
@@ -46,9 +48,13 @@ fn is_read_only_post(path: &str) -> bool {
             | "/graph/search"
             | "/skills/search"
             | "/messages/search"
+            // MCP is a read-capable authenticated transport. Individual tool
+            // calls enforce their registry scope before internal dispatch.
+            | "/mcp"
     )
 }
 
+/// Builds a forbidden JSON response with a stable error envelope.
 fn forbid(msg: &str) -> Response {
     let body = serde_json::json!({ "error": msg });
     axum::response::Response::builder()
@@ -63,6 +69,7 @@ fn forbid(msg: &str) -> Response {
         })
 }
 
+/// Builds an unauthorized JSON response with a stable error envelope.
 fn unauthorized(msg: &str) -> Response {
     let body = serde_json::json!({ "error": msg });
     axum::response::Response::builder()
@@ -77,6 +84,7 @@ fn unauthorized(msg: &str) -> Response {
         })
 }
 
+/// Builds the owner context used only when explicit open access is enabled.
 fn open_access_context() -> AuthContext {
     AuthContext {
         key: ApiKey {
@@ -95,10 +103,12 @@ fn open_access_context() -> AuthContext {
         },
         user_id: 1,
         act_as: None,
+        act_as_access: None,
         identity: None,
     }
 }
 
+/// Builds request-local key metadata for an authenticated signing identity.
 fn synthetic_key_for_identity(user_id: i64) -> ApiKey {
     synthetic_key_for_identity_with_scopes(user_id, None)
 }
@@ -136,6 +146,7 @@ fn synthetic_key_for_identity_with_scopes(user_id: i64, scopes_csv: Option<&str>
     }
 }
 
+/// Reports whether the process configuration explicitly permits open access.
 fn open_access_allowed() -> bool {
     if kleos_lib::kleos_env("OPEN_ACCESS").as_deref() != Ok("1") {
         return false;
@@ -151,6 +162,7 @@ fn open_access_allowed() -> bool {
 
 static REQUIRE_SIG_USERS: OnceLock<Vec<i64>> = OnceLock::new();
 
+/// Reports whether requests for a user must carry an identity signature.
 fn signature_required_for_user(user_id: i64) -> bool {
     let users = REQUIRE_SIG_USERS.get_or_init(|| {
         std::env::var("KLEOS_REQUIRE_SIGNATURE_FOR_USER")
@@ -346,14 +358,17 @@ async fn validate_mcp_token(
         key,
         user_id: ik_user_id,
         act_as: None,
+        act_as_access: None,
         identity: None,
     })
 }
 
+/// Reads a UTF-8 request header without allocating.
 fn header_str<'a>(req: &'a Request<Body>, name: &str) -> Option<&'a str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
+/// Holds validated identity-signature headers before cryptographic verification.
 struct SignedHeaders {
     sig_hex: String,
     algo: SignatureAlgo,
@@ -366,6 +381,7 @@ struct SignedHeaders {
     model_label: Option<String>,
 }
 
+/// Parses the complete identity-signature header set or rejects partial input.
 fn parse_signed_headers(
     req: &Request<Body>,
 ) -> Option<std::result::Result<SignedHeaders, &'static str>> {
@@ -398,6 +414,7 @@ fn parse_signed_headers(
     })())
 }
 
+/// Holds the persisted public-key fields needed to verify an identity request.
 struct IdentityKeyRow {
     id: i64,
     user_id: i64,
@@ -408,6 +425,7 @@ struct IdentityKeyRow {
 }
 
 #[tracing::instrument(skip_all, fields(middleware = "server.auth"))]
+/// Authenticates the request and installs its effective authorization context.
 pub async fn auth_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -767,6 +785,7 @@ pub async fn auth_middleware(
             key: synthetic_key_for_identity_with_scopes(user_id, ik_row.scopes_json.as_deref()),
             user_id,
             act_as: None,
+            act_as_access: None,
             identity: Some(identity_ctx),
         };
 
@@ -881,7 +900,8 @@ pub async fn auth_middleware(
     // in localStorage.
     // ---------------------------------------------------------------
     {
-        let is_write = requires_write_scope(&method);
+        let is_transport_write = requires_write_scope(&method);
+        let is_logical_write = is_transport_write && !is_read_only_post(&path);
         if let Some(session) = crate::routes::gui::get_gui_session(&state, request.headers()).await
         {
             // M5 parity with the session lane (Path 1): a GUI cookie is a
@@ -893,15 +913,20 @@ pub async fn auth_middleware(
                     "gui-cookie auth rejected: signature required for this user");
                 return unauthorized("signature required for this user");
             }
-            let required_scope = if is_write { Scope::Write } else { Scope::Read };
-            let csrf_ok =
-                !is_write || crate::routes::gui::verify_gui_csrf(&state, request.headers()).await;
+            let required_scope = if is_logical_write {
+                Scope::Write
+            } else {
+                Scope::Read
+            };
+            let csrf_ok = !is_transport_write
+                || crate::routes::gui::verify_gui_csrf(&state, request.headers()).await;
             if session.has_scope(&required_scope) && csrf_ok {
                 let scopes_csv = kleos_lib::auth::scopes_to_string(&session.scopes);
                 let auth_ctx = AuthContext {
                     key: synthetic_key_for_identity_with_scopes(session.user_id, Some(&scopes_csv)),
                     user_id: session.user_id,
                     act_as: None,
+                    act_as_access: None,
                     identity: None,
                 };
                 let user_id = auth_ctx.user_id;
@@ -932,6 +957,7 @@ pub async fn auth_middleware(
 
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
+        /// Describes the signed enrollment proof supplied by a new identity.
         struct EnrollProof {
             algo: String,
             tier: String,
@@ -1053,6 +1079,7 @@ pub async fn auth_middleware(
             key: synthetic_key_for_identity(1),
             user_id: 1,
             act_as: None,
+            act_as_access: None,
             identity: None,
         };
 
@@ -1078,6 +1105,7 @@ pub async fn auth_middleware(
     unauthorized("Authentication required. Provide X-Kleos-Sig header or Bearer token.")
 }
 
+/// Decodes a PEM public key into its DER payload.
 fn decode_pem_der(pem: &str) -> Option<Vec<u8>> {
     let begin = "-----BEGIN PUBLIC KEY-----";
     let end = "-----END PUBLIC KEY-----";
@@ -1092,6 +1120,7 @@ fn decode_pem_der(pem: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(&b64).ok()
 }
 
+/// Loads an active identity and its authorization scopes by identifier.
 async fn resolve_identity_by_id(
     state: &AppState,
     identity_id: i64,
@@ -1134,6 +1163,7 @@ async fn resolve_identity_by_id(
         key: synthetic_key_for_identity_with_scopes(user_id, scopes_json.as_deref()),
         user_id,
         act_as: None,
+        act_as_access: None,
         identity: Some(IdentityCtx {
             identity_id: Some(identity_id),
             identity_key_id: ik_id,
@@ -1147,10 +1177,20 @@ async fn resolve_identity_by_id(
 }
 
 #[cfg(test)]
+/// Covers persisted identity-scope interpretation and legacy compatibility.
 mod identity_scope_tests {
     use super::*;
 
+    /// Only explicitly registered logical-read POST paths bypass Write scope.
     #[test]
+    fn unknown_post_is_not_classified_as_read() {
+        assert!(is_read_only_post("/mcp"));
+        assert!(is_read_only_post("/search"));
+        assert!(!is_read_only_post("/not-a-logical-read"));
+    }
+
+    #[test]
+    /// Confirms stored comma-separated scopes determine authorization exactly.
     fn stored_csv_scopes_are_used_verbatim() {
         let key = synthetic_key_for_identity_with_scopes(7, Some("read,write"));
         assert!(key.scopes.contains(&Scope::Read));
@@ -1162,6 +1202,7 @@ mod identity_scope_tests {
     }
 
     #[test]
+    /// Confirms an explicit empty scope set grants no administrative access.
     fn empty_scopes_deny_not_admin() {
         let key = synthetic_key_for_identity_with_scopes(7, Some(""));
         assert!(
@@ -1172,6 +1213,7 @@ mod identity_scope_tests {
     }
 
     #[test]
+    /// Confirms unknown scope names do not imply administrative access.
     fn unknown_scopes_deny_not_admin() {
         let key = synthetic_key_for_identity_with_scopes(7, Some("bogus,nonsense"));
         assert!(
@@ -1182,12 +1224,14 @@ mod identity_scope_tests {
     }
 
     #[test]
+    /// Confirms administrative access requires the stored admin scope.
     fn admin_is_granted_only_when_explicitly_stored() {
         let key = synthetic_key_for_identity_with_scopes(7, Some("read,write,admin"));
         assert!(key.scopes.contains(&Scope::Admin));
     }
 
     #[test]
+    /// Confirms identities from schemas without scope data retain legacy access.
     fn missing_column_keeps_legacy_admin() {
         // None == no stored scopes (pre-v53 rows / user-1 bootstrap path).
         let key = synthetic_key_for_identity_with_scopes(1, None);
