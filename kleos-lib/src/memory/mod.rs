@@ -17,15 +17,25 @@
 //! SELECT shape and row-to-struct mapping in sync -- see the guard tests at
 //! the bottom of this file.
 
+/// Low-confidence retrieval abstention.
 pub mod abstain;
+/// Inferred tags and categories for new content.
 pub mod auto_tag;
+/// Structured-fact retrieval channel.
 pub mod facts_channel;
+/// Full-text search helpers.
 pub mod fts;
+/// Memory scoring and decay.
 pub mod scoring;
+/// Hybrid memory search and retrieval.
 pub mod search;
+/// Near-duplicate content hashing.
 pub mod simhash;
+/// Memory request and response types.
 pub mod types;
+/// Vector retrieval helpers.
 pub mod vector;
+/// Vector index backfill and reconciliation.
 pub mod vector_sync;
 
 use crate::db::Database;
@@ -53,6 +63,7 @@ use crate::validation::{MAX_CONTENT_SIZE, MAX_SEARCH_LIMIT};
 
 // -- Helpers ---
 
+/// Trim, normalize, and serialize nonempty tag lists.
 fn normalize_tags(tags: &Option<Vec<String>>) -> Option<String> {
     tags.as_ref().and_then(|t| {
         let normalized: Vec<String> = t
@@ -655,7 +666,13 @@ pub async fn store(
     let req_for_tx = req.clone();
     let tags_json_for_tx = tags_json.clone();
     let category_for_tx = category.clone();
-    let quota_for_tx = tenant_quota.clone();
+    // Bound tenant databases enforce live policy and accounting for every SQL
+    // producer. Retain the explicit quota argument only for legacy callers.
+    let quota_for_tx = if db.has_tenant_write_policy() {
+        None
+    } else {
+        tenant_quota.clone()
+    };
     let content_bytes_for_tx = content_bytes;
 
     let new_id = db
@@ -1467,6 +1484,7 @@ pub async fn purge_trashed(
     retention_days: i64,
     update_counters: bool,
 ) -> Result<usize> {
+    let update_counters = update_counters && !db.has_tenant_write_policy();
     db.write(move |conn| {
         let cutoff = format!("-{} days", retention_days);
 
@@ -1528,6 +1546,7 @@ pub async fn update(
     user_id: i64,
     update_counters: bool,
 ) -> Result<Memory> {
+    let update_counters = update_counters && !db.has_tenant_write_policy();
     // SEC-recall-1.8: L2-normalize a supplied embedding so cosine semantics
     // hold regardless of provider. Mirrors the same step in `store`.
     if let Some(ref mut emb) = req.embedding {
@@ -1575,12 +1594,9 @@ pub async fn update(
     let new_category = req.category.as_deref().unwrap_or(&old.category).to_string();
     let new_importance = clamp_importance(req.importance.unwrap_or(old.importance));
     let new_is_static = req.is_static.unwrap_or(old.is_static) as i32;
-    // SEC-gate: the review gate assumes the storing agent cannot approve its
-    // own pending memory. Honoring a client-supplied status here was an
-    // unguarded self-approval: `POST /memory/{id}/update {"status":"approved"}`
-    // flipped a pending row to approved with only ownership auth, bypassing the
-    // dedicated review surface. Status transitions are permitted solely through
-    // the authorized inbox endpoints (inbox::approve_memory / reject_memory).
+    // Status transitions use the dedicated inbox endpoints so approval effects
+    // stay consistent. The storing model may approve its own pending memories;
+    // human review is optional. This generic edit path does not perform approval.
     // Reject any attempt to change status through this generic edit path; a
     // no-op status equal to the stored value is allowed so idempotent clients
     // that echo the current status do not break.
@@ -1859,6 +1875,7 @@ fn update_transactional_rusqlite(
 
 // -- Additional DB operations matching TS db.ts ---
 
+/// Hide an owned memory and retire its active retrieval entries.
 #[tracing::instrument(skip(db))]
 pub async fn mark_forgotten(db: &Database, id: i64, user_id: i64) -> Result<()> {
     let affected = db

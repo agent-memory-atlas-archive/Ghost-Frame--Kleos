@@ -80,10 +80,14 @@ pub async fn sample_active_tenants(registry: &Arc<TenantRegistry>) -> Result<()>
             }
         };
 
-        // Write estimate into shard database.
+        let quota = handle.quota();
+        let exceeded = quota.disk_bytes.is_some_and(|limit| disk_bytes > limit);
+
+        // Persist the estimate and enforcement state together so shard reloads
+        // cannot briefly reopen writes after a disk quota breach.
         let db = handle.database();
         let update_result = db
-            .write(move |conn| {
+            .transaction(move |conn| {
                 conn.execute(
                     "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
                      WHERE key = 'disk_bytes_estimate'",
@@ -93,6 +97,11 @@ pub async fn sample_active_tenants(registry: &Arc<TenantRegistry>) -> Result<()>
                     "UPDATE tenant_state SET value = strftime('%s', 'now'), \
                      updated_at = datetime('now') WHERE key = 'disk_sampled_at'",
                     [],
+                )?;
+                conn.execute(
+                    "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
+                     WHERE key = 'read_only'",
+                    rusqlite::params![i64::from(exceeded)],
                 )?;
                 Ok(())
             })
@@ -104,12 +113,7 @@ pub async fn sample_active_tenants(registry: &Arc<TenantRegistry>) -> Result<()>
                 "disk sampler: failed to write estimate: {}",
                 e
             );
-        }
-
-        // Enforce the disk quota by toggling read_only on the handle.
-        let quota = handle.quota();
-        if let Some(limit) = quota.disk_bytes {
-            let exceeded = disk_bytes > limit;
+        } else {
             let was_read_only = handle.is_read_only();
             if exceeded != was_read_only {
                 handle.set_read_only(exceeded);
@@ -117,14 +121,14 @@ pub async fn sample_active_tenants(registry: &Arc<TenantRegistry>) -> Result<()>
                     warn!(
                         tenant = %handle.tenant_id,
                         disk_bytes,
-                        limit,
+                        limit = quota.disk_bytes.unwrap_or_default(),
                         "disk quota exceeded -- tenant set to read-only"
                     );
                 } else {
                     tracing::info!(
                         tenant = %handle.tenant_id,
                         disk_bytes,
-                        limit,
+                        limit = ?quota.disk_bytes,
                         "disk quota cleared -- tenant read-only lifted"
                     );
                 }
@@ -138,6 +142,7 @@ pub async fn sample_active_tenants(registry: &Arc<TenantRegistry>) -> Result<()>
 }
 
 #[cfg(test)]
+/// Covers tenant shard disk accounting behavior.
 mod tests {
     use super::*;
     use std::io::Write;

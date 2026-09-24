@@ -82,6 +82,17 @@ impl TenantLoader {
     ///
     /// Returns the existing handle if already loaded, otherwise loads from disk.
     pub async fn get_or_load(&self, tenant_id: &str, row: &TenantRow) -> Result<Arc<TenantHandle>> {
+        self.get_or_load_with_quota(tenant_id, row, QuotaConfig::default())
+            .await
+    }
+
+    /// Get or load a tenant with quota limits read from the registry row family.
+    pub async fn get_or_load_with_quota(
+        &self,
+        tenant_id: &str,
+        row: &TenantRow,
+        initial_quota: QuotaConfig,
+    ) -> Result<Arc<TenantHandle>> {
         // Fast path: check if already loaded
         {
             let handles = self.handles.read().await;
@@ -111,11 +122,16 @@ impl TenantLoader {
         }
 
         // Load the tenant once the per-tenant gate is held.
-        self.load_tenant(tenant_id, row).await
+        self.load_tenant(tenant_id, row, initial_quota).await
     }
 
     /// Load a tenant from disk.
-    async fn load_tenant(&self, tenant_id: &str, row: &TenantRow) -> Result<Arc<TenantHandle>> {
+    async fn load_tenant(
+        &self,
+        tenant_id: &str,
+        row: &TenantRow,
+        initial_quota: QuotaConfig,
+    ) -> Result<Arc<TenantHandle>> {
         // Check status
         if row.status == TenantStatus::Suspended {
             return Err(EngError::Auth("tenant is suspended".to_string()));
@@ -220,11 +236,42 @@ impl TenantLoader {
         db.chunk_vector_index = chunk_vector_index;
         let db = Arc::new(db);
 
-        let initial_quota = QuotaConfig {
-            content_bytes: row.quota_bytes,
-            memory_count: row.quota_memories,
-            disk_bytes: None,
-        };
+        // Reconcile derived counters on every shard open. This repairs stale
+        // values from interrupted or legacy writers before quota enforcement.
+        let disk_limit = initial_quota.disk_bytes;
+        let persisted_read_only = db
+            .transaction(move |tx| {
+                let (content_bytes, memory_count): (i64, i64) = tx.query_row(
+                    "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0), COUNT(*) \
+                 FROM memories WHERE is_latest = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                tx.execute(
+                    "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
+                 WHERE key = 'content_bytes'",
+                    rusqlite::params![content_bytes],
+                )?;
+                tx.execute(
+                    "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
+                 WHERE key = 'memory_count'",
+                    rusqlite::params![memory_count],
+                )?;
+                let disk_bytes_estimate: i64 = tx.query_row(
+                    "SELECT value FROM tenant_state WHERE key = 'disk_bytes_estimate'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let read_only = disk_limit.is_some_and(|limit| disk_bytes_estimate > limit);
+                tx.execute(
+                    "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
+                     WHERE key = 'read_only'",
+                    rusqlite::params![i64::from(read_only)],
+                )?;
+                Ok(read_only)
+            })
+            .await?;
+
         let handle = Arc::new(TenantHandle {
             tenant_id: tenant_id.to_string(),
             user_id: row.user_id.clone(),
@@ -233,11 +280,16 @@ impl TenantLoader {
             created_at: SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(row.created_at as u64),
             last_access: std::sync::Mutex::new(Instant::now()),
-            quota: arc_swap::ArcSwap::from_pointee(initial_quota),
-            dirty: std::sync::atomic::AtomicBool::new(false),
-            read_only: std::sync::atomic::AtomicBool::new(false),
+            quota: crate::tenant::types::shared_quota(initial_quota),
+            dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            read_only: Arc::new(std::sync::atomic::AtomicBool::new(persisted_read_only)),
             shard_path: tenant_dir.clone(),
         });
+        handle.db.bind_tenant_write_policy(
+            handle.quota.clone(),
+            handle.read_only.clone(),
+            handle.dirty.clone(),
+        )?;
 
         // Store in cache
         {

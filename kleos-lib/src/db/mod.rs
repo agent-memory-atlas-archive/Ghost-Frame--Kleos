@@ -1,12 +1,26 @@
+//! SQLite database lifecycle, pools, migrations, and guarded tenant writers.
+
+/// Snapshot creation and verification.
 pub mod backup;
+/// Schema convergence against the declared manifest.
 pub mod converge;
+/// Shared database schema migrations.
 pub mod migrations;
+/// Point-in-time snapshot discovery and preparation.
 pub mod pitr;
+/// SQLite reader and writer connection pools.
 pub mod pool;
+/// Database schema definitions.
 pub mod schema;
+/// Expected table and column manifests.
 pub mod schema_manifest;
+/// SQL schema statements.
 pub mod schema_sql;
+/// Tenant shard schema migration chain.
 pub mod tenant_migrations;
+/// Connection-local guards for tenant memory writes.
+mod tenant_write_policy;
+/// Pool configuration and backup data types.
 pub mod types;
 
 use crate::config::Config;
@@ -16,7 +30,7 @@ use crate::vector::VectorIndex;
 use crate::{EngError, Result};
 #[cfg(feature = "ml")]
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 pub use pool::DatabasePools;
@@ -38,6 +52,7 @@ pub struct Database {
     pub embedding_chunk_overlap: usize,
     pub embedding_chunk_max_chunks: usize,
     is_tenant: bool,
+    tenant_write_policy: OnceLock<tenant_write_policy::TenantWritePolicy>,
 }
 
 /// Constructors and connection/pool plumbing.
@@ -125,6 +140,7 @@ impl Database {
             embedding_chunk_overlap: config.embedding_chunk_overlap,
             embedding_chunk_max_chunks: config.embedding_chunk_max_chunks,
             is_tenant: false,
+            tenant_write_policy: OnceLock::new(),
         })
     }
 
@@ -171,6 +187,7 @@ impl Database {
             embedding_chunk_overlap: 160,
             embedding_chunk_max_chunks: 6,
             is_tenant: false,
+            tenant_write_policy: OnceLock::new(),
         })
     }
 
@@ -241,6 +258,7 @@ impl Database {
             embedding_chunk_overlap: 160,
             embedding_chunk_max_chunks: 6,
             is_tenant: true,
+            tenant_write_policy: OnceLock::new(),
         })
     }
 
@@ -290,6 +308,7 @@ impl Database {
             embedding_chunk_overlap: 160,
             embedding_chunk_max_chunks: 6,
             is_tenant: true,
+            tenant_write_policy: OnceLock::new(),
         })
     }
 
@@ -307,6 +326,32 @@ impl Database {
     /// Returns true if this is a tenant shard database.
     pub fn is_tenant(&self) -> bool {
         self.is_tenant
+    }
+
+    /// Bind live tenant policy before publishing the shard handle to callers.
+    pub fn bind_tenant_write_policy(
+        &self,
+        quota: Arc<arc_swap::ArcSwap<crate::tenant::types::QuotaConfig>>,
+        read_only: Arc<std::sync::atomic::AtomicBool>,
+        dirty: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        if !self.is_tenant {
+            return Err(EngError::InvalidInput(
+                "tenant policy requires a tenant database".into(),
+            ));
+        }
+        self.tenant_write_policy
+            .set(tenant_write_policy::TenantWritePolicy {
+                quota,
+                read_only,
+                dirty,
+            })
+            .map_err(|_| EngError::InvalidInput("tenant write policy already bound".into()))
+    }
+
+    /// Whether writer triggers own quota checks and memory usage accounting.
+    pub fn has_tenant_write_policy(&self) -> bool {
+        self.tenant_write_policy.get().is_some()
     }
 
     /// Path of the underlying database file (":memory:" for test DBs).
@@ -344,9 +389,30 @@ impl Database {
             EngError::DatabaseMessage(format!("failed to acquire writer pool connection: {e}"))
         })?;
 
-        conn.interact(move |conn| f(conn)).await.map_err(|e| {
-            EngError::DatabaseMessage(format!("writer pool interaction failed: {e}"))
-        })?
+        let policy =
+            self.tenant_write_policy
+                .get()
+                .map(|policy| tenant_write_policy::TenantWritePolicy {
+                    quota: policy.quota.clone(),
+                    read_only: policy.read_only.clone(),
+                    dirty: policy.dirty.clone(),
+                });
+        conn.interact(move |conn| {
+            if let Some(policy) = &policy {
+                tenant_write_policy::prepare(conn, policy)?;
+            }
+            let result = f(conn).map_err(tenant_write_policy::classify);
+            if let Some(policy) = &policy {
+                // A multi-statement closure can persist an earlier statement even
+                // when a later one fails. Dirty is an advisory reconciliation hint.
+                policy
+                    .dirty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            result
+        })
+        .await
+        .map_err(|e| EngError::DatabaseMessage(format!("writer pool interaction failed: {e}")))?
     }
 
     /// Execute a transaction on the database.

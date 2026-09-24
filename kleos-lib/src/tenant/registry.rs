@@ -8,7 +8,7 @@
 use super::id::tenant_id_from_user;
 use super::loader::TenantLoader;
 use super::registry_db::RegistryDb;
-use super::types::{TenantConfig, TenantHandle, TenantRow, TenantStatus};
+use super::types::{QuotaConfig, TenantConfig, TenantHandle, TenantRow, TenantStatus};
 use crate::{EngError, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +38,7 @@ pub struct TenantRegistry {
     config: TenantConfig,
 }
 
+/// Provides tenant lookup, lifecycle, quota, and cache operations.
 impl TenantRegistry {
     /// Create a new tenant registry.
     ///
@@ -113,7 +114,10 @@ impl TenantRegistry {
         };
 
         // Load or get from cache
-        self.loader.get_or_load(&row.tenant_id, &row).await
+        let quota = self.quota_config(user_id)?;
+        self.loader
+            .get_or_load_with_quota(&row.tenant_id, &row, quota)
+            .await
     }
 
     /// Get a tenant by user_id without creating.
@@ -122,7 +126,11 @@ impl TenantRegistry {
     pub async fn get(&self, user_id: &str) -> Result<Option<Arc<TenantHandle>>> {
         match self.registry_db.get_by_user_id(user_id)? {
             Some(row) => {
-                let handle = self.loader.get_or_load(&row.tenant_id, &row).await?;
+                let quota = self.quota_config(user_id)?;
+                let handle = self
+                    .loader
+                    .get_or_load_with_quota(&row.tenant_id, &row, quota)
+                    .await?;
                 Ok(Some(handle))
             }
             None => Ok(None),
@@ -332,19 +340,19 @@ impl TenantRegistry {
             .ok_or_else(|| crate::EngError::NotFound(format!("tenant not found: {}", user_id)))?;
         let db = handle.database();
         let (bytes, count) = db
-            .write(|conn| {
-                let (b, c): (i64, i64) = conn.query_row(
-                    "SELECT COALESCE(SUM(length(content)), 0), COUNT(*) \
+            .transaction(|tx| {
+                let (b, c): (i64, i64) = tx.query_row(
+                    "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0), COUNT(*) \
                          FROM memories WHERE is_latest = 1",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
-                conn.execute(
+                tx.execute(
                     "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
                      WHERE key = 'content_bytes'",
                     rusqlite::params![b],
                 )?;
-                conn.execute(
+                tx.execute(
                     "UPDATE tenant_state SET value = ?1, updated_at = datetime('now') \
                      WHERE key = 'memory_count'",
                     rusqlite::params![c],
@@ -360,9 +368,21 @@ impl TenantRegistry {
     pub fn get_quota_row(&self, user_id: &str) -> Result<crate::tenant::types::TenantQuotaRow> {
         self.registry_db.get_quota_row(user_id)
     }
+
+    /// Load configured limits from the canonical E2 registry columns.
+    fn quota_config(&self, user_id: &str) -> Result<QuotaConfig> {
+        let row = self.registry_db.get_quota_row(user_id)?;
+        Ok(QuotaConfig {
+            content_bytes: row.quota_content_bytes,
+            memory_count: row.quota_memory_count,
+            disk_bytes: row.quota_disk_bytes,
+        })
+    }
 }
 
+/// Formats registry configuration without exposing live connection internals.
 impl std::fmt::Debug for TenantRegistry {
+    /// Writes the safe registry fields to the debug formatter.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TenantRegistry")
             .field("data_root", &self.data_root)
@@ -372,6 +392,7 @@ impl std::fmt::Debug for TenantRegistry {
 }
 
 #[cfg(test)]
+/// Covers tenant identity, loading, and quota persistence.
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -379,7 +400,6 @@ mod tests {
     /// Shared TenantConfig builder reserved for future registry-level tests
     /// (LRU eviction, lazy load, shutdown). Currently only
     /// `test_tenant_id_generation` runs here and does not need a config.
-    #[allow(dead_code)]
     fn test_config() -> TenantConfig {
         TenantConfig {
             max_resident: 10,
@@ -389,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms tenant identifiers are stable and filesystem-safe.
     fn test_tenant_id_generation() {
         // Safe IDs pass through
         assert_eq!(tenant_id_from_user("alice"), "alice");
@@ -397,5 +418,102 @@ mod tests {
         // Unsafe IDs get hashed
         assert!(tenant_id_from_user("../etc/passwd").starts_with("t_"));
         assert!(tenant_id_from_user("user@example.com").starts_with("t_"));
+    }
+
+    /// Registry quota columns survive eviction, and shard reopen repairs stale
+    /// counters using UTF-8 byte length before the next enforced write.
+    #[tokio::test]
+    async fn quota_and_unicode_usage_survive_shard_reload() {
+        let temp = tempfile::tempdir().expect("temporary tenant root");
+        let registry =
+            TenantRegistry::new(temp.path(), test_config(), 384, false, None).expect("registry");
+        let handle = registry.get_or_create("41").await.expect("create tenant");
+        handle
+            .database()
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO memories (content, user_id, is_latest) VALUES ('é', 41, 1)",
+                    [],
+                )?;
+                conn.execute("UPDATE tenant_state SET value = 0", [])?;
+                Ok(())
+            })
+            .await
+            .expect("seed stale usage");
+        registry
+            .update_quota("41", Some(2), Some(1), Some(4096))
+            .await
+            .expect("persist quota");
+        let tenant_id = handle.tenant_id.clone();
+        drop(handle);
+        registry.evict(&tenant_id).await.expect("evict tenant");
+
+        let reloaded = registry.get("41").await.expect("reload").expect("tenant");
+        let quota = reloaded.quota();
+        assert_eq!(quota.content_bytes, Some(2));
+        assert_eq!(quota.memory_count, Some(1));
+        assert_eq!(quota.disk_bytes, Some(4096));
+        let usage: (i64, i64) = reloaded
+            .database()
+            .read(|conn| {
+                let bytes = conn.query_row(
+                    "SELECT value FROM tenant_state WHERE key = 'content_bytes'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let count = conn.query_row(
+                    "SELECT value FROM tenant_state WHERE key = 'memory_count'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((bytes, count))
+            })
+            .await
+            .expect("usage");
+        assert_eq!(usage, (2, 1));
+
+        let request = crate::memory::types::StoreRequest {
+            content: "quota overflow".to_string(),
+            user_id: Some(41),
+            parent_memory_id: Some(1),
+            ..Default::default()
+        };
+        let database = reloaded.database();
+        let error = crate::memory::store(
+            database.as_ref(),
+            request,
+            Some(quota),
+            reloaded.is_read_only(),
+        )
+        .await
+        .expect_err("reloaded quota must enforce final slot");
+        assert!(matches!(error, crate::EngError::QuotaExceeded(_)));
+
+        reloaded
+            .database()
+            .write(|conn| {
+                conn.execute(
+                    "UPDATE tenant_state SET value = 999999 WHERE key = 'disk_bytes_estimate'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE tenant_state SET value = 1 WHERE key = 'read_only'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("seed stale disk lock");
+        registry
+            .update_quota("41", Some(2), Some(1), None)
+            .await
+            .expect("remove disk limit");
+        drop(reloaded);
+        registry.evict(&tenant_id).await.expect("evict again");
+        let unlocked = registry.get("41").await.expect("reload").expect("tenant");
+        assert!(
+            !unlocked.is_read_only(),
+            "removed disk quota must clear persisted read-only state on reload"
+        );
     }
 }
