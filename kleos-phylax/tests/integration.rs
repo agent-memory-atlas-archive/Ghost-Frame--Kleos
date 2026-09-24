@@ -2224,3 +2224,54 @@ async fn test_adversarial_agent_cannot_obtain_plaintext_via_any_mode() {
         }
     }
 }
+
+/// Valid calls through both router branches leave the authentication failure budget available.
+#[tokio::test]
+async fn maintenance_phylax_valid_calls_preserve_failure_budget() {
+    let app = TestApp::new().await;
+    for _ in 0..20 {
+        for path in ["/secrets", "/phylax/namespaces"] {
+            let (status, _) = app.request_master("GET", path, None).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+        }
+    }
+    let mut pending = tokio::task::JoinSet::new();
+    for index in 0..20 {
+        let router = app.router.clone();
+        pending.spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .uri(if index % 2 == 0 {
+                            "/secrets"
+                        } else {
+                            "/phylax/namespaces"
+                        })
+                        .header("authorization", "Bearer invalid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(status) = pending.join_next().await {
+        outcomes.push(status.unwrap());
+    }
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|status| **status == StatusCode::UNAUTHORIZED)
+            .count(),
+        10
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|status| **status == StatusCode::TOO_MANY_REQUESTS)
+            .count(),
+        10
+    );
+}

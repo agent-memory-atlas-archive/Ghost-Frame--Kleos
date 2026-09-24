@@ -1,3 +1,5 @@
+//! Ranks memory searches and caches results by their effective search inputs.
+
 use super::fts::fts_search;
 use super::vector::{chunk_vector_search, vector_search};
 use super::{row_to_memory, MEMORY_COLUMNS};
@@ -83,6 +85,14 @@ fn shard_idx(user_id: i64, param_hash: u64) -> usize {
 fn hash_search_params(req: &SearchRequest) -> u64 {
     let mut h = DefaultHasher::new();
     req.query.hash(&mut h);
+    // Presence, length, and vector bits distinguish degraded search and each
+    // effective embedding without allocating a second copy of the vector.
+    req.embedding.as_ref().map(Vec::len).hash(&mut h);
+    if let Some(embedding) = &req.embedding {
+        for value in embedding {
+            value.to_bits().hash(&mut h);
+        }
+    }
     req.limit.hash(&mut h);
     req.category.hash(&mut h);
     req.source.hash(&mut h);
@@ -2222,6 +2232,25 @@ mod tests {
         semantic_score_from_distance, Candidate, GraphExpansionRow,
     };
     use crate::memory::types::{SearchBudget, SearchRequest, SearchStrategy};
+
+    /// Degraded and vector-backed searches cannot reuse each other's cached rankings.
+    #[test]
+    fn maintenance_embedding_cache_identity() {
+        let absent = SearchRequest {
+            query: "same query".into(),
+            ..Default::default()
+        };
+        let mut first = absent.clone();
+        first.embedding = Some(vec![1.0, 0.0]);
+        let mut second = first.clone();
+        second.embedding = Some(vec![0.0, 1.0]);
+        assert_ne!(hash_search_params(&absent), hash_search_params(&first));
+        assert_ne!(hash_search_params(&first), hash_search_params(&second));
+        assert_eq!(
+            hash_search_params(&first),
+            hash_search_params(&first.clone())
+        );
+    }
 
     /// MEM-3: only real dates are accepted as date-range bounds; arbitrary
     /// long strings must be rejected so they cannot silently alter SQL filters.

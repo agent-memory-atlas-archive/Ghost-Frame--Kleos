@@ -7,7 +7,7 @@
 use clap::Subcommand;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::time::Duration;
 
 use crate::Client;
@@ -53,10 +53,18 @@ const MAX_GATE_COMPLETIONS_PER_STOP: usize = 64;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for sidecar /recall requests (memory retrieval before prompt processing).
 const SIDECAR_RECALL_TIMEOUT: Duration = Duration::from_secs(12);
+/// Timeout for best-effort sidecar session registration.
+const SIDECAR_SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Timeout for sidecar /observe requests (tool result observation storage).
 const SIDECAR_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Timeout for sidecar /end requests (session teardown notification).
 const SIDECAR_END_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum transcript tail read for per-prompt dialogue context.
+const RECALL_TRANSCRIPT_TAIL_BYTES: u64 = 1024 * 1024;
+/// Maximum number of prior user or assistant messages added to a recall query.
+const RECALL_DIALOGUE_MESSAGES: usize = 2;
+/// Maximum characters contributed by any one prior dialogue message.
+const RECALL_DIALOGUE_MESSAGE_CHARS: usize = 260;
 
 // --- Policy fetch with cache ---
 
@@ -141,6 +149,129 @@ fn extract_session_id(input: &Value) -> String {
         .unwrap_or_else(|| std::env::var("PPID").unwrap_or_else(|_| "unknown".to_string()))
 }
 
+/// Extracts plain text from a Claude or Codex transcript message payload.
+fn transcript_message(value: &Value) -> Option<(&str, String)> {
+    let message = value.get("message").or_else(|| {
+        let payload = value.get("payload")?;
+        (payload.get("type").and_then(Value::as_str) == Some("message")).then_some(payload)
+    })?;
+    let role = message.get("role").and_then(Value::as_str)?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+
+    let content = message.get("content")?;
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    (!text.trim().is_empty()).then_some((role, text))
+}
+
+/// Reads a bounded transcript tail and returns recent dialogue before the current prompt.
+fn recent_dialogue(input: &Value, current_prompt: &str) -> Vec<(String, String)> {
+    let Some(path) = input.get("transcript_path").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return Vec::new();
+    };
+    let start = length.saturating_sub(RECALL_TRANSCRIPT_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let tail = String::from_utf8_lossy(&bytes);
+    let complete_tail = if start == 0 {
+        tail.as_ref()
+    } else {
+        tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+    };
+
+    let mut skipped_current = false;
+    let mut dialogue = Vec::new();
+    for line in complete_tail.lines().rev() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some((role, text)) = transcript_message(&value) else {
+            continue;
+        };
+        if !skipped_current && role == "user" && text.trim() == current_prompt.trim() {
+            skipped_current = true;
+            continue;
+        }
+        dialogue.push((role.to_string(), text));
+        if dialogue.len() == RECALL_DIALOGUE_MESSAGES {
+            break;
+        }
+    }
+    dialogue
+}
+
+/// Truncates recall text by Unicode scalar count without splitting UTF-8.
+fn truncate_recall_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// Builds a bounded recall query that preserves the current prompt and recent subject context.
+fn contextual_recall_message(input: &Value, current_prompt: &str, max_chars: usize) -> String {
+    if current_prompt.chars().count() >= max_chars / 2 {
+        return truncate_recall_text(current_prompt, max_chars);
+    }
+    let dialogue = recent_dialogue(input, current_prompt);
+    if dialogue.is_empty() {
+        return current_prompt.to_string();
+    }
+
+    let mut query = format!(
+        "Current prompt: {}\nRecent dialogue (newest first):",
+        current_prompt
+    );
+    for (role, text) in dialogue {
+        let remaining = max_chars.saturating_sub(query.chars().count());
+        if remaining <= role.len() + 5 {
+            break;
+        }
+        let prefix = format!("\n[{role}] ");
+        query.push_str(&prefix);
+        let remaining = max_chars.saturating_sub(query.chars().count());
+        query.push_str(&truncate_recall_text(
+            &text,
+            remaining.min(RECALL_DIALOGUE_MESSAGE_CHARS),
+        ));
+    }
+    query
+}
+
+/// Return the hook-provided working directory or the process working directory.
+fn hook_cwd(input: &Value) -> Option<String> {
+    input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        })
+}
+
 /// Legacy fixed bootstrap query, kept as the fallback when no cwd is available.
 const LEGACY_BOOTSTRAP_QUERY: &str =
     "session-bootstrap agent-rules infrastructure active-tasks recent-decisions";
@@ -189,15 +320,7 @@ fn bootstrap_task_query(input: &Value) -> String {
 /// the coordination read-back so Chiasm/Axon know which checkout this session
 /// is in (the record previously reported a useless "unknown").
 fn cwd_project(input: &Value) -> Option<String> {
-    let cwd = input
-        .get("cwd")
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string())
-        })?;
+    let cwd = hook_cwd(input)?;
     std::path::Path::new(&cwd)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -343,6 +466,56 @@ fn extract_tool_result_text(input: &Value, max_chars: usize) -> String {
                 .unwrap_or_default()
         });
     raw.chars().take(max_chars).collect()
+}
+
+/// Recursively collect path-shaped string fields from bounded tool input JSON.
+fn collect_touched_paths(value: &Value, depth: usize, paths: &mut Vec<String>) {
+    if depth > 8 || paths.len() >= 64 {
+        return;
+    }
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "file_path" | "filePath" | "path" | "notebook_path"
+                ) {
+                    if let Some(path) = value.as_str().filter(|path| !path.trim().is_empty()) {
+                        let normalized = path.replace('\\', "/");
+                        if !paths.contains(&normalized) {
+                            paths.push(normalized);
+                        }
+                    }
+                }
+                collect_touched_paths(value, depth + 1, paths);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_touched_paths(item, depth + 1, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract repository path hints from the hook event's tool input.
+fn extract_touched_paths(input: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(tool_input) = input.get("tool_input") {
+        collect_touched_paths(tool_input, 0, &mut paths);
+    }
+    paths.sort();
+    paths
+}
+
+/// Return whether a successful tool event may have changed repository files.
+fn tool_may_modify_repository(tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase().replace(['-', '_'], "");
+    matches!(
+        normalized.as_str(),
+        "bash" | "write" | "edit" | "multiedit" | "notebookedit" | "applypatch"
+    ) || normalized.ends_with("applypatch")
 }
 
 /// Whether a gate that cannot be reached should deny (fail closed) rather than
@@ -552,6 +725,8 @@ fn derive_command(tool_name: &str, tool_input: &Value) -> String {
 async fn handle_session_start(client: &Client, input: &Value) {
     let agent = resolve_agent();
     let project = cwd_project(input);
+    let session_id = extract_session_id(input);
+    let cwd = hook_cwd(input);
 
     // Read coordination state BEFORE registering this session, so the banner
     // reflects who was already working in this project, not our own arrival.
@@ -572,6 +747,17 @@ async fn handle_session_start(client: &Client, input: &Value) {
             DEFAULT_TIMEOUT,
         )
         .await;
+
+    let _ = sidecar_post(
+        "/session/start",
+        &json!({
+            "session_id": session_id,
+            "agent": agent.clone(),
+            "cwd": cwd,
+        }),
+        SIDECAR_SESSION_TIMEOUT,
+    )
+    .await;
 
     // Fetch growth context (best-effort)
     let growth_path = format!(
@@ -662,13 +848,16 @@ async fn handle_user_prompt(client: &Client, input: &Value) {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(800);
 
+            let recall_message = contextual_recall_message(input, user_message, max_query_chars);
             let recall_body = json!({
-                "message": user_message,
+                "message": recall_message,
                 "budget": budget,
                 "context_turns": context_turns,
                 "max_tokens": max_tokens,
                 "max_query_chars": max_query_chars,
                 "session_id": session_id,
+                "cwd": hook_cwd(input),
+                "may_modify_repo": false,
             });
 
             sidecar_post("/recall", &recall_body, SIDECAR_RECALL_TIMEOUT)
@@ -844,6 +1033,8 @@ async fn handle_post_tool(client: &Client, input: &Value) {
         .and_then(|t| t.as_str())
         .unwrap_or("unknown");
     let session_id = extract_session_id(input);
+    let touched_paths = extract_touched_paths(input);
+    let may_modify_repo = tool_may_modify_repository(tool_name);
 
     // Report activity (best-effort)
     let _ = client
@@ -865,6 +1056,9 @@ async fn handle_post_tool(client: &Client, input: &Value) {
         "session_id": session_id,
         "importance": 3,
         "category": "discovery",
+        "cwd": hook_cwd(input),
+        "touched_paths": touched_paths,
+        "may_modify_repo": may_modify_repo,
     });
     let _ = sidecar_post("/observe", &observe_body, SIDECAR_OBSERVE_TIMEOUT).await;
 }
@@ -1171,6 +1365,60 @@ mod tests {
         assert!(!id.is_empty());
     }
 
+    /// Verifies Codex rollout messages expose their role and textual content.
+    #[test]
+    fn test_transcript_message_reads_codex_payload() {
+        let value = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Codex Remote Control is failing"}]
+            }
+        });
+        let (role, text) = transcript_message(&value).expect("message should parse");
+        assert_eq!(role, "assistant");
+        assert_eq!(text, "Codex Remote Control is failing");
+    }
+
+    /// Verifies a short follow-up gains its prior subject while skipping itself.
+    #[test]
+    fn test_contextual_recall_message_uses_recent_dialogue() {
+        let path = std::env::temp_dir().join(format!(
+            "kleos-recall-transcript-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let lines = [
+            json!({"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Remote Control broke on every phone"}]}}),
+            json!({"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I am checking Codex Remote Control versions"}]}}),
+            json!({"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"it worked yesterday"}]}}),
+        ];
+        let transcript = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, transcript).expect("transcript fixture should write");
+        let input = json!({"transcript_path": path});
+
+        let query = contextual_recall_message(&input, "it worked yesterday", 800);
+
+        let _ = std::fs::remove_file(input["transcript_path"].as_str().unwrap_or_default());
+        assert!(query.starts_with("Current prompt: it worked yesterday"));
+        assert!(query.contains("Codex Remote Control versions"));
+        assert!(query.contains("Remote Control broke on every phone"));
+        assert_eq!(query.matches("it worked yesterday").count(), 1);
+    }
+
+    /// Verifies self-contained long prompts are not diluted with transcript history.
+    #[test]
+    fn test_contextual_recall_message_preserves_long_prompt() {
+        let prompt = "x".repeat(500);
+        let query = contextual_recall_message(&json!({}), &prompt, 800);
+        assert_eq!(query, prompt);
+    }
+
     #[test]
     /// Verifies Bash tool inputs use the literal command string.
     fn test_derive_command_bash() {
@@ -1198,5 +1446,36 @@ mod tests {
         let input = json!({"url": "https://example.com"});
         let cmd = derive_command("WebFetch", &input);
         assert_eq!(cmd, "https://example.com");
+    }
+
+    /// Nested tool inputs yield unique path hints and ignore unrelated strings.
+    #[test]
+    fn extracts_bounded_touched_paths() {
+        let input = json!({
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "edits": [
+                    {"path": "src/main.rs"},
+                    {"filePath": "/repo/src/lib.rs"},
+                    {"message": "not/a/path/hint"}
+                ]
+            }
+        });
+
+        assert_eq!(
+            extract_touched_paths(&input),
+            vec!["/repo/src/lib.rs", "src/main.rs"]
+        );
+    }
+
+    /// Mutating hook tools trigger incremental refresh while read-only tools do not.
+    #[test]
+    fn classifies_repository_mutators() {
+        assert!(tool_may_modify_repository("Edit"));
+        assert!(tool_may_modify_repository("NotebookEdit"));
+        assert!(tool_may_modify_repository("mcp__filesystem__apply_patch"));
+        assert!(tool_may_modify_repository("Bash"));
+        assert!(!tool_may_modify_repository("Read"));
+        assert!(!tool_may_modify_repository("WebSearch"));
     }
 }

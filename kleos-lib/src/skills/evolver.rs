@@ -1,3 +1,5 @@
+//! Generates and persists versioned skill evolution with owner-scoped lineage.
+
 pub use super::types::{EvolutionRequest, EvolutionResult};
 
 use crate::db::Database;
@@ -141,8 +143,19 @@ pub async fn persist_evolved_skill(
     let parent_ids_owned = parent_ids.to_vec();
     let tags_owned = tags.to_vec();
 
-    db.write(move |conn| {
-        let (version, root_id) = if let Some(&parent_id) = parent_ids_owned.first() {
+    db.transaction(move |conn| {
+        // Validate every parent inside the transaction so no cross-owner or
+        // invalid lineage can leave a partially persisted skill.
+        for parent_id in &parent_ids_owned {
+            let owned: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM skill_records WHERE id = ?1 AND user_id = ?2)",
+                params![parent_id, user_id], |row| row.get(0),
+            )?;
+            if !owned {
+                return Err(EngError::InvalidInput("skill parent not found for owner".into()));
+            }
+        }
+        let (parent_version, root_id) = if let Some(&parent_id) = parent_ids_owned.first() {
             let mut stmt = conn
                 .prepare("SELECT version, root_skill_id FROM skill_records WHERE id = ?1")?;
             let mut rows = stmt
@@ -152,13 +165,22 @@ pub async fn persist_evolved_skill(
                     row.get(0)?;
                 let pr: Option<i64> =
                     row.get(1)?;
-                (pv + 1, pr.or(Some(parent_id)))
+                (pv, pr.or(Some(parent_id)))
             } else {
-                (1, None)
+                (0, None)
             }
         } else {
-            (1, None)
+            (0, None)
         };
+
+        // The model may reuse a slug from another lineage or capture. Allocate
+        // above every existing version of that owner/name/agent atomically.
+        let latest: i32 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM skill_records WHERE name = ?1 AND agent = ?2 AND user_id = ?3",
+            params![name_owned, agent_owned, user_id], |row| row.get(0),
+        )?;
+        let version = parent_version.max(latest).checked_add(1)
+            .ok_or_else(|| EngError::InvalidInput("skill version limit reached".into()))?;
 
         conn.execute(
             "INSERT INTO skill_records \
@@ -494,6 +516,134 @@ pub async fn evolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tag storage failure rolls back the new skill and its already inserted lineage.
+    #[tokio::test]
+    async fn maintenance_evolution_rolls_back_tag_failure() {
+        let db = Database::connect_memory().await.unwrap();
+        let parent = persist_evolved_skill(&db, "parent", "", "", "dreamer", &[], &[], 1)
+            .await
+            .unwrap();
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_tag BEFORE INSERT ON skill_tags BEGIN SELECT RAISE(ABORT, 'injected tag failure'); END;",
+            )?;
+            Ok(())
+        }).await.unwrap();
+        let result = persist_evolved_skill(
+            &db,
+            "child",
+            "",
+            "",
+            "dreamer",
+            &[parent],
+            &["tag".into()],
+            1,
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected tag failure"));
+        let counts = db
+            .read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM skill_records", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM skill_lineage_parents", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, (1, 0));
+    }
+
+    /// Concurrent generations retain separate versions and their complete lineage.
+    #[tokio::test]
+    async fn maintenance_concurrent_evolution_versions() {
+        let db = Database::connect_memory().await.unwrap();
+        let parent = persist_evolved_skill(&db, "parent", "", "", "dreamer", &[], &[], 1)
+            .await
+            .unwrap();
+        let parents = [parent];
+        let tags = ["derived".to_string()];
+        let (a, b) = tokio::join!(
+            persist_evolved_skill(&db, "same-name", "", "a", "dreamer", &parents, &tags, 1),
+            persist_evolved_skill(&db, "same-name", "", "b", "dreamer", &parents, &tags, 1)
+        );
+        let a = skills::get_skill(&db, a.unwrap(), 1).await.unwrap();
+        let b = skills::get_skill(&db, b.unwrap(), 1).await.unwrap();
+        assert_ne!(a.version, b.version);
+        assert_eq!(a.parent_skill_id, Some(parent));
+        assert_eq!(b.parent_skill_id, Some(parent));
+        assert!(
+            persist_evolved_skill(&db, "wrong-owner", "", "", "dreamer", &parents, &tags, 2)
+                .await
+                .is_err()
+        );
+    }
+
+    /// Repeated generated names allocate versions without overwriting prior content.
+    #[tokio::test]
+    async fn maintenance_evolution_name_collision() {
+        let db = Database::connect_memory().await.unwrap();
+        let first = persist_evolved_skill(
+            &db,
+            "collision",
+            "first",
+            "original",
+            "dreamer",
+            &[],
+            &[],
+            1,
+        )
+        .await
+        .unwrap();
+        let second =
+            persist_evolved_skill(&db, "collision", "second", "new", "dreamer", &[], &[], 1)
+                .await
+                .unwrap();
+        assert_ne!(first, second);
+        let old = skills::get_skill(&db, first, 1).await.unwrap();
+        let new = skills::get_skill(&db, second, 1).await.unwrap();
+        assert_eq!(old.code, "original");
+        assert_eq!(new.version, old.version + 1);
+    }
+
+    /// Invalid lineage cannot leave a partial skill record behind.
+    #[tokio::test]
+    async fn maintenance_evolution_rolls_back_invalid_parent() {
+        let db = Database::connect_memory().await.unwrap();
+        let parent = persist_evolved_skill(&db, "parent", "", "", "dreamer", &[], &[], 1)
+            .await
+            .unwrap();
+        assert!(persist_evolved_skill(
+            &db,
+            "child",
+            "",
+            "",
+            "dreamer",
+            &[parent, i64::MAX],
+            &[],
+            1
+        )
+        .await
+        .is_err());
+        let count = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM skill_records WHERE name = 'child'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 
     /// Verifies that code fences are stripped when absent.
     #[test]

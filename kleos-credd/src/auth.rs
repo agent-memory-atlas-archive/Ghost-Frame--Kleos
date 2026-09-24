@@ -23,6 +23,10 @@ use crate::state::AppState;
 /// Pre-auth rate limit: 10 failed attempts per 60-second window.
 const PREAUTH_LIMIT: u32 = 10;
 
+/// Marks responses whose bearer authentication completed successfully.
+#[derive(Clone, Copy)]
+struct AuthenticationSucceeded;
+
 /// Marker inserted by the Unix-socket listener middleware so downstream
 /// middleware (rate limiter, auth) can identify connections that came over
 /// the 0600 Unix socket. Such connections are inherently scoped to the
@@ -37,10 +41,23 @@ fn ip_to_key(addr: &std::net::IpAddr) -> i64 {
     hasher.finish() as i64
 }
 
-/// Pre-authentication rate-limiting middleware.
+/// Returns one fail-closed rate-limit response with a bounded retry delay.
+fn rate_limited_response(retry_after: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "rate limit exceeded",
+            "retry_after": retry_after
+        })),
+    )
+        .into_response()
+}
+
+/// Limits failed authentication attempts by the real TCP peer address.
 ///
-/// Uses the real TCP peer address (ConnectInfo) to prevent brute-force
-/// token guessing. Runs BEFORE auth_middleware in the layer stack.
+/// The outer middleware checks the existing failure window, delegates to
+/// authentication, and records only an unauthorized response. Valid bearer
+/// traffic never consumes the brute-force budget.
 /// Skipped entirely for Unix-socket connections (0600 socket = single UID).
 #[tracing::instrument(skip_all, fields(middleware = "credd.preauth_rate_limit"))]
 pub async fn preauth_rate_limit(
@@ -70,17 +87,22 @@ pub async fn preauth_rate_limit(
         .map(|ci| ip_to_key(&ci.0.ip()))
         .unwrap_or(0);
 
-    match state.rate_limiter.check(key, PREAUTH_LIMIT) {
-        Ok(_count) => next.run(request).await,
-        Err(retry_after) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "rate limit exceeded",
-                "retry_after": retry_after
-            })),
-        )
-            .into_response(),
+    if let Some(retry_after) = state.rate_limiter.retry_after(key, PREAUTH_LIMIT) {
+        return rate_limited_response(retry_after);
     }
+
+    let response = next.run(request).await;
+    if response.status() == StatusCode::UNAUTHORIZED
+        && response
+            .extensions()
+            .get::<AuthenticationSucceeded>()
+            .is_none()
+    {
+        if let Err(retry_after) = state.rate_limiter.check(key, PREAUTH_LIMIT) {
+            return rate_limited_response(retry_after);
+        }
+    }
+    response
 }
 
 /// Authentication result passed to handlers.
@@ -97,7 +119,9 @@ pub enum AuthInfo {
     BootstrapAgent { name: String, scopes: Vec<String> },
 }
 
+/// Exposes identity and permission queries shared by credential handlers.
 impl AuthInfo {
+    /// Returns the authenticated Kleos user identifier or bootstrap sentinel.
     pub fn user_id(&self) -> i64 {
         match self {
             Self::Master { user_id } => *user_id,
@@ -108,10 +132,12 @@ impl AuthInfo {
         }
     }
 
+    /// Reports whether this identity has unrestricted master-key authority.
     pub fn is_master(&self) -> bool {
         matches!(self, Self::Master { .. })
     }
 
+    /// Returns the scoped agent name when authentication used an agent token.
     pub fn agent_name(&self) -> Option<&str> {
         match self {
             Self::Master { .. } => None,
@@ -120,6 +146,7 @@ impl AuthInfo {
         }
     }
 
+    /// Reports whether this identity may access the requested secret category.
     pub fn can_access_category(&self, category: &str) -> bool {
         match self {
             Self::Master { .. } => true,
@@ -130,6 +157,7 @@ impl AuthInfo {
         }
     }
 
+    /// Reports whether this identity may retrieve unredacted secret values.
     pub fn can_access_raw(&self) -> bool {
         match self {
             Self::Master { .. } => true,
@@ -241,7 +269,9 @@ pub async fn auth_middleware(
     };
 
     request.extensions_mut().insert(auth);
-    Ok(next.run(request).await)
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(AuthenticationSucceeded);
+    Ok(response)
 }
 
 /// Look the bearer up in the file-backed bootstrap-agent store. Returns
@@ -264,9 +294,12 @@ fn check_bootstrap_agent(token: &str, state: &AppState) -> Result<AuthInfo, Stat
 #[derive(Clone)]
 pub struct Auth(pub AuthInfo);
 
+/// Extracts the authenticated identity inserted by the auth middleware.
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Auth {
+    /// Rejects requests whose middleware did not establish an identity.
     type Rejection = StatusCode;
 
+    /// Reads and clones the established identity from request extensions.
     fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
