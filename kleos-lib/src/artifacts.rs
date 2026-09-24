@@ -48,6 +48,21 @@ pub struct ArtifactSummary {
     pub size_bytes: i64,
 }
 
+/// Fully validated inline artifact ready for one transactional batch insert.
+#[derive(Debug, Clone)]
+pub struct PreparedInlineArtifact {
+    /// Display filename stored with the attachment.
+    pub filename: String,
+    /// Validated media type stored with the attachment.
+    pub mime_type: String,
+    /// Decoded attachment bytes.
+    pub data: Vec<u8>,
+    /// SHA-256 digest of the decoded bytes.
+    pub sha256: String,
+    /// Optional UTF-8 content eligible for artifact full-text search.
+    pub indexable_content: Option<String>,
+}
+
 /// Compute SHA-256 hash of byte data, returned as a hex string.
 pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
@@ -222,6 +237,84 @@ pub async fn store_artifact(
             |row| row.get::<_, i64>(0),
         )
         .map_err(|e| crate::EngError::Internal(format!("failed to insert artifact: {e}")))
+    })
+    .await
+}
+
+/// Store a validated inline attachment batch atomically and idempotently.
+///
+/// Identity is `(owner, memory, filename, media type, digest)`. A retry returns
+/// the existing row, while a concurrent retry serializes through the database
+/// transaction and cannot create a second attachment with the same identity.
+pub async fn store_inline_batch(
+    db: &Database,
+    user_id: i64,
+    memory_id: i64,
+    artifacts: &[PreparedInlineArtifact],
+) -> Result<Vec<ArtifactSummary>> {
+    let artifacts = artifacts.to_vec();
+    db.transaction(move |tx| {
+        let owns_memory = tx
+            .query_row(
+                "SELECT 1 FROM memories WHERE id = ?1 AND user_id = ?2",
+                params![memory_id, user_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if owns_memory.is_none() {
+            return Err(crate::EngError::NotFound("memory not found".into()));
+        }
+
+        let mut stored = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            let size_bytes = i64::try_from(artifact.data.len())
+                .map_err(|_| crate::EngError::InvalidInput("artifact is too large".into()))?;
+            let existing = tx
+                .query_row(
+                    "SELECT id FROM artifacts \
+                     WHERE user_id = ?1 AND memory_id = ?2 AND filename = ?3 \
+                       AND mime_type = ?4 AND sha256 = ?5 LIMIT 1",
+                    params![
+                        user_id,
+                        memory_id,
+                        artifact.filename,
+                        artifact.mime_type,
+                        artifact.sha256
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    tx.execute(
+                        "INSERT INTO artifacts \
+                         (name, memory_id, filename, artifact_type, content, mime_type, \
+                          size_bytes, sha256, storage_mode, data, is_encrypted, is_indexed, user_id) \
+                         VALUES (?1, ?2, ?1, 'file', ?3, ?4, ?5, ?6, 'inline', ?7, 0, ?8, ?9)",
+                        params![
+                            artifact.filename,
+                            memory_id,
+                            artifact.indexable_content,
+                            artifact.mime_type,
+                            size_bytes,
+                            artifact.sha256,
+                            artifact.data,
+                            artifact.indexable_content.is_some() as i64,
+                            user_id
+                        ],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+            };
+            stored.push(ArtifactSummary {
+                id,
+                filename: artifact.filename,
+                mime_type: artifact.mime_type,
+                size_bytes,
+            });
+        }
+        Ok(stored)
     })
     .await
 }
