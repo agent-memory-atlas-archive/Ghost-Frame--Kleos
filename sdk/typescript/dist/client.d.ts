@@ -32,6 +32,7 @@ export declare class EngramClient {
     private readonly baseUrl;
     private readonly apiKey;
     private readonly timeout;
+    /** Normalize the server URL and retain authentication and timeout settings. */
     constructor(config: EngramClientConfig);
     /**
      * Make an authenticated request to the API.

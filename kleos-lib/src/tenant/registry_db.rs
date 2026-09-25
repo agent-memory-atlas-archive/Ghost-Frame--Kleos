@@ -72,6 +72,7 @@ pub struct RegistryDb {
     path: PathBuf,
 }
 
+/// Provides synchronized registry metadata and lifecycle persistence operations.
 impl RegistryDb {
     /// Open or create the registry database.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, EngError> {
@@ -118,6 +119,7 @@ impl RegistryDb {
         let _ =
             conn.execute_batch("ALTER TABLE tenants ADD COLUMN disk_bytes_used INTEGER DEFAULT 0;");
         let _ = conn.execute_batch("ALTER TABLE tenants ADD COLUMN last_synced_at TEXT;");
+        Self::migrate_legacy_quota_columns(&conn)?;
 
         info!("registry database opened: {}", path.display());
 
@@ -149,6 +151,7 @@ impl RegistryDb {
         let _ =
             conn.execute_batch("ALTER TABLE tenants ADD COLUMN disk_bytes_used INTEGER DEFAULT 0;");
         let _ = conn.execute_batch("ALTER TABLE tenants ADD COLUMN last_synced_at TEXT;");
+        Self::migrate_legacy_quota_columns(&conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -178,6 +181,22 @@ impl RegistryDb {
         }
     }
 
+    /// Move pre-E2 quota values into canonical columns once, then clear the
+    /// legacy fields so a later explicit `None` remains distinguishable.
+    fn migrate_legacy_quota_columns(conn: &Connection) -> Result<(), EngError> {
+        conn.execute_batch(
+            "UPDATE tenants SET
+                 quota_content_bytes = COALESCE(quota_content_bytes, quota_bytes),
+                 quota_memory_count = COALESCE(quota_memory_count, quota_memories)
+             WHERE quota_bytes IS NOT NULL OR quota_memories IS NOT NULL;
+             UPDATE tenants SET quota_bytes = NULL, quota_memories = NULL
+             WHERE quota_bytes IS NOT NULL OR quota_memories IS NOT NULL;",
+        )
+        .map_err(|error| {
+            EngError::Internal(format!("failed to migrate legacy tenant quotas: {error}"))
+        })
+    }
+
     /// Get a tenant by tenant_id.
     pub fn get_by_tenant_id(&self, tenant_id: &str) -> Result<Option<TenantRow>, EngError> {
         let conn = self.lock()?;
@@ -205,8 +224,9 @@ impl RegistryDb {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO tenants (tenant_id, user_id, created_at, status, data_path,
-                                  schema_version, quota_bytes, quota_memories, last_access)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                  schema_version, quota_bytes, quota_memories, last_access,
+                                  quota_content_bytes, quota_memory_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?7, ?8)",
             rusqlite::params![
                 row.tenant_id,
                 row.user_id,
@@ -231,8 +251,9 @@ impl RegistryDb {
         let conn = self.lock()?;
         conn.execute(
             "INSERT OR IGNORE INTO tenants (tenant_id, user_id, created_at, status, data_path,
-                                            schema_version, quota_bytes, quota_memories, last_access)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                            schema_version, quota_bytes, quota_memories, last_access,
+                                            quota_content_bytes, quota_memory_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?7, ?8)",
             rusqlite::params![
                 row.tenant_id,
                 row.user_id,
@@ -847,12 +868,14 @@ impl RegistryDb {
         .map_err(|e| EngError::NotFound(format!("tenant not found: {user_id}: {e}")))
     }
 
+    /// Acquires the registry connection or reports a poisoned mutex.
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, EngError> {
         self.conn
             .lock()
             .map_err(|_| EngError::Internal("failed to acquire registry lock".to_string()))
     }
 
+    /// Maps one query row into the tenant persistence representation.
     fn row_to_tenant(row: &rusqlite::Row<'_>) -> Result<TenantRow, EngError> {
         Ok(TenantRow {
             tenant_id: row
@@ -889,7 +912,9 @@ impl RegistryDb {
     }
 }
 
+/// Formats the registry database without exposing its live connection.
 impl std::fmt::Debug for RegistryDb {
+    /// Writes safe registry database fields to the debug formatter.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistryDb")
             .field("path", &self.path)
@@ -898,9 +923,11 @@ impl std::fmt::Debug for RegistryDb {
 }
 
 #[cfg(test)]
+/// Covers registry metadata and lifecycle persistence.
 mod tests {
     use super::*;
 
+    /// Returns the current Unix timestamp for lifecycle fixtures.
     fn now_secs() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -909,6 +936,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms inserted tenant metadata can be loaded by identifier.
     fn test_insert_and_get() {
         let db = RegistryDb::open_memory().unwrap();
         let now = now_secs();
@@ -931,9 +959,13 @@ mod tests {
         assert_eq!(fetched.tenant_id, "tenant_1");
         assert_eq!(fetched.user_id, "user_1");
         assert_eq!(fetched.status, TenantStatus::Active);
+        let quota = db.get_quota_row("user_1").unwrap();
+        assert_eq!(quota.quota_content_bytes, Some(1_000_000));
+        assert_eq!(quota.quota_memory_count, Some(1000));
     }
 
     #[test]
+    /// Confirms tenant lifecycle status updates persist.
     fn test_update_status() {
         let db = RegistryDb::open_memory().unwrap();
         let now = now_secs();
@@ -959,6 +991,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms tenant listing and status counts agree.
     fn test_list_and_count() {
         let db = RegistryDb::open_memory().unwrap();
         let now = now_secs();
@@ -999,6 +1032,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms deletion starts only from eligible lifecycle states.
     fn test_mark_deleting_only_active_or_suspended() {
         let db = RegistryDb::open_memory().unwrap();
         db.insert(&make_row("t1", "u1", TenantStatus::Active))
@@ -1021,6 +1055,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms tombstones and stuck-deletion markers persist details.
     fn test_mark_tombstone_and_stuck() {
         let db = RegistryDb::open_memory().unwrap();
         db.insert(&make_row("t1", "u1", TenantStatus::Active))
@@ -1042,6 +1077,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms status-filtered listing returns only matching tenants.
     fn test_list_by_status() {
         let db = RegistryDb::open_memory().unwrap();
         db.insert(&make_row("t1", "u1", TenantStatus::Active))
@@ -1060,6 +1096,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms deletion journal rows support their persistence lifecycle.
     fn test_deletion_log_crud() {
         let db = RegistryDb::open_memory().unwrap();
         let dep_id = "dep-001";
@@ -1101,6 +1138,7 @@ mod tests {
     }
 
     #[test]
+    /// Confirms purging removes only expired tombstones.
     fn test_purge_expired_tombstones() {
         let db = RegistryDb::open_memory().unwrap();
         db.insert(&make_row("t1", "u1", TenantStatus::Active))
@@ -1147,5 +1185,37 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "column {col} must exist on tenants table");
         }
+    }
+
+    /// Opening a pre-E2 registry preserves configured legacy quotas in the
+    /// canonical columns and clears the migration markers exactly once.
+    #[test]
+    fn legacy_quota_values_migrate_to_canonical_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("system");
+        std::fs::create_dir_all(&system).unwrap();
+        let path = system.join("registry.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tenants (
+                 tenant_id TEXT PRIMARY KEY, user_id TEXT UNIQUE NOT NULL,
+                 created_at INTEGER NOT NULL, status TEXT NOT NULL,
+                 data_path TEXT NOT NULL, schema_version INTEGER NOT NULL,
+                 quota_bytes INTEGER, quota_memories INTEGER,
+                 last_access INTEGER NOT NULL
+             );
+             INSERT INTO tenants VALUES
+                 ('legacy', '77', 1, 'active', '/legacy', 1, 8192, 12, 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = RegistryDb::open(dir.path()).unwrap();
+        let quota = db.get_quota_row("77").unwrap();
+        assert_eq!(quota.quota_content_bytes, Some(8192));
+        assert_eq!(quota.quota_memory_count, Some(12));
+        let row = db.get_by_user_id("77").unwrap().unwrap();
+        assert_eq!(row.quota_bytes, None);
+        assert_eq!(row.quota_memories, None);
     }
 }

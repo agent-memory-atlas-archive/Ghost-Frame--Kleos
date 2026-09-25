@@ -1,3 +1,5 @@
+//! Stores workflows and advances bounded, dependency-ordered execution steps.
+
 use crate::db::Database;
 use crate::services::axon::publish_internal;
 use crate::{EngError, Result};
@@ -15,6 +17,7 @@ pub struct StepDef {
     pub config: Option<serde_json::Value>,
     pub depends_on: Option<Vec<String>>,
     pub max_retries: Option<i32>,
+    /// Per-attempt execution timeout in milliseconds, 1..=300000; defaults to 30000.
     pub timeout_ms: Option<i32>,
 }
 
@@ -35,9 +38,17 @@ const VALID_STEP_TYPES: &[&str] = &[
 /// the engine and the target. Applied when steps are materialized in create_run.
 const MAX_STEP_RETRIES: i32 = 10;
 
+/// Maximum duration of one webhook or LLM execution attempt, including legacy runs.
+const MAX_STEP_TIMEOUT_MS: i32 = 300_000;
+
+/// Bounds stored execution values, including workflows created before validation.
+fn step_timeout(timeout_ms: i32) -> std::time::Duration {
+    std::time::Duration::from_millis(timeout_ms.clamp(1, MAX_STEP_TIMEOUT_MS) as u64)
+}
+
 /// Validate a workflow's step graph before it is stored or run.
 ///
-/// Rejects three classes of malformed graph that would otherwise wedge a run:
+/// Rejects unsupported timeouts and malformed graphs that would otherwise wedge a run:
 /// duplicate step names (dependency resolution is name-keyed, so a duplicate is
 /// ambiguous), a `depends_on` that names a step not present in the workflow (the
 /// dependency can never complete, so the dependent step is never ready), and a
@@ -49,6 +60,15 @@ fn validate_step_graph(steps: &[StepDef]) -> Result<()> {
 
     let mut names: HashSet<&str> = HashSet::with_capacity(steps.len());
     for step in steps {
+        if step
+            .timeout_ms
+            .is_some_and(|timeout| !(1..=MAX_STEP_TIMEOUT_MS).contains(&timeout))
+        {
+            return Err(EngError::InvalidInput(format!(
+                "step '{}' timeout_ms must be between 1 and {}",
+                step.name, MAX_STEP_TIMEOUT_MS
+            )));
+        }
         if !names.insert(step.name.as_str()) {
             return Err(EngError::InvalidInput(format!(
                 "duplicate step name '{}'",
@@ -744,7 +764,10 @@ pub async fn create_run(db: &Database, req: CreateRunRequest) -> Result<Run> {
             // Clamp to [0, MAX_STEP_RETRIES] so a workflow cannot request
             // unbounded (or negative) retries and wedge/DoS the engine.
             let max_retries = step_def.max_retries.unwrap_or(3).clamp(0, MAX_STEP_RETRIES);
-            let timeout_ms = step_def.timeout_ms.unwrap_or(30000);
+            let timeout_ms = step_def
+                .timeout_ms
+                .unwrap_or(30000)
+                .clamp(1, MAX_STEP_TIMEOUT_MS);
 
             conn.execute(
                 "INSERT INTO loom_steps
@@ -1652,7 +1675,7 @@ pub async fn execute_webhook_step(
         .and_then(|v| v.as_str())
         .unwrap_or("POST")
         .to_uppercase();
-    let timeout = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+    let timeout = step_timeout(timeout_ms);
 
     let body = serde_json::json!({
         "step_id": step_id,
@@ -1781,7 +1804,7 @@ pub async fn execute_llm_step(
         .get("temperature")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.7);
-    let timeout = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
+    let timeout = step_timeout(timeout_ms);
 
     let is_openai_compat = url.contains("/v1/chat") || url.contains("/chat/completions");
 
@@ -1978,6 +2001,30 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use serde_json::json;
+
+    /// Previously persisted extreme timeouts remain bounded when a run is resumed.
+    #[test]
+    fn maintenance_legacy_timeout_is_bounded() {
+        assert_eq!(step_timeout(i32::MAX).as_millis(), 300_000);
+        assert_eq!(step_timeout(0).as_millis(), 1);
+        assert_eq!(step_timeout(-1).as_millis(), 1);
+        assert_eq!(step_timeout(30_000).as_millis(), 30_000);
+    }
+
+    /// Rejects execution timeouts outside the supported one-millisecond to five-minute range.
+    #[test]
+    fn maintenance_workflow_timeout_validation() {
+        for timeout in [0, -1, 300_001, i32::MAX] {
+            let mut step = transform_step("bounded", &[], json!({}));
+            step.timeout_ms = Some(timeout);
+            assert!(validate_step_graph(&[step]).is_err(), "accepted {timeout}");
+        }
+        for timeout in [1, 30_000, 300_000] {
+            let mut step = transform_step("bounded", &[], json!({}));
+            step.timeout_ms = Some(timeout);
+            assert!(validate_step_graph(&[step]).is_ok());
+        }
+    }
 
     /// Fresh in-memory DB with the full migration chain (loom tables included).
     async fn setup() -> Database {

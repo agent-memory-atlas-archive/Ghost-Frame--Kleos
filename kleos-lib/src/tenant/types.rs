@@ -148,6 +148,11 @@ impl Default for QuotaConfig {
     }
 }
 
+/// Creates the shared, live quota policy used by a tenant database and handle.
+pub fn shared_quota(config: QuotaConfig) -> Arc<ArcSwap<QuotaConfig>> {
+    Arc::new(ArcSwap::from_pointee(config))
+}
+
 /// A loaded tenant handle with database and vector index connections.
 ///
 /// This struct represents a "live" tenant with open connections.
@@ -177,16 +182,16 @@ pub struct TenantHandle {
     /// Cached quota limits for this tenant. Updated by admin operations.
     /// ArcSwap enables wait-free reads on the write hot path without
     /// blocking the background quota-sync writer.
-    pub quota: ArcSwap<QuotaConfig>,
+    pub quota: Arc<ArcSwap<QuotaConfig>>,
 
     /// True if a counter-mutating write occurred since the last registry sync.
     /// The quota-sync job checks this flag with Relaxed ordering (advisory).
-    pub dirty: AtomicBool,
+    pub dirty: Arc<AtomicBool>,
 
     /// True when the disk quota is exceeded. Set by the disk sampler job.
     /// Uses Acquire/Release ordering because the write path reads this flag
     /// to short-circuit before entering a transaction.
-    pub read_only: AtomicBool,
+    pub read_only: Arc<AtomicBool>,
 
     /// Path to the tenant shard directory. Used by the disk sampler for du.
     pub shard_path: PathBuf,
@@ -225,6 +230,9 @@ impl TenantHandle {
 
     /// Replace the cached quota configuration. Called by admin update routes.
     pub fn refresh_quota(&self, new: QuotaConfig) {
+        if new.disk_bytes.is_none() {
+            self.read_only.store(false, Ordering::Release);
+        }
         self.quota.store(Arc::new(new));
     }
 

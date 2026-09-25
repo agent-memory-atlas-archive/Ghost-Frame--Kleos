@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine;
-use kleos_lib::artifacts::{self, ArtifactSummary, StoreArtifactOpts};
+use kleos_lib::artifacts::{self, PreparedInlineArtifact};
 use kleos_lib::graph::entities::extract_and_link_entities;
 use kleos_lib::intelligence::extraction::fast_extract_facts;
 use kleos_lib::memory::{
@@ -13,7 +13,8 @@ use kleos_lib::memory::{
     abstain::{abstain_gate, AbstainConfig},
     search::{faceted_search, hybrid_search, hybrid_search_reranked},
     types::{
-        FacetedSearchRequest, ListOptions, QuestionType, SearchRequest, StoreRequest, UpdateRequest,
+        FacetedSearchRequest, InlineArtifactInput, ListOptions, QuestionType, SearchRequest,
+        StoreRequest, UpdateRequest,
     },
 };
 use rusqlite::params;
@@ -34,6 +35,75 @@ use types::{
     CalendarQuery, ForgetBody, ListQuery, RecallBody, SearchBody, SearchTagsBody, TrashListOptions,
     UpdateTagsBody,
 };
+
+/// Validate and decode every inline attachment before the memory write begins.
+fn prepare_inline_artifacts(
+    inputs: Option<Vec<InlineArtifactInput>>,
+) -> Result<Vec<PreparedInlineArtifact>, AppError> {
+    let inputs = inputs.unwrap_or_default();
+    if inputs.len() > 10 {
+        return Err(AppError(kleos_lib::EngError::InvalidInput(
+            "at most 10 inline artifacts per store call".into(),
+        )));
+    }
+    let mut prepared = Vec::with_capacity(inputs.len());
+    let mut total_bytes = 0usize;
+    for input in inputs {
+        let filename = input.filename.trim();
+        if filename.is_empty() || filename.len() > 255 {
+            return Err(AppError(kleos_lib::EngError::InvalidInput(
+                "inline artifact filename must contain 1 to 255 bytes".into(),
+            )));
+        }
+        let mime_type = input
+            .mime_type
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        if mime_type.is_empty() || mime_type.len() > 255 {
+            return Err(AppError(kleos_lib::EngError::InvalidInput(
+                "inline artifact MIME type must contain 1 to 255 bytes".into(),
+            )));
+        }
+        if input.data_base64.is_empty() {
+            return Err(AppError(kleos_lib::EngError::InvalidInput(
+                "inline artifact data_base64 must not be empty".into(),
+            )));
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&input.data_base64)
+            .map_err(|error| {
+                AppError(kleos_lib::EngError::InvalidInput(format!(
+                    "invalid base64 in artifact '{}': {error}",
+                    input.filename
+                )))
+            })?;
+        if data.len() > kleos_lib::validation::MAX_ARTIFACT_UPLOAD_BYTES {
+            return Err(AppError(kleos_lib::EngError::InvalidInput(format!(
+                "inline artifact '{}' exceeds {} bytes",
+                input.filename,
+                kleos_lib::validation::MAX_ARTIFACT_UPLOAD_BYTES
+            ))));
+        }
+        total_bytes = total_bytes.checked_add(data.len()).ok_or_else(|| {
+            AppError(kleos_lib::EngError::InvalidInput(
+                "inline artifact batch size overflow".into(),
+            ))
+        })?;
+        if total_bytes > kleos_lib::validation::MAX_ARTIFACT_UPLOAD_BYTES {
+            return Err(AppError(kleos_lib::EngError::InvalidInput(format!(
+                "inline artifact batch exceeds {} bytes",
+                kleos_lib::validation::MAX_ARTIFACT_UPLOAD_BYTES
+            ))));
+        }
+        prepared.push(PreparedInlineArtifact {
+            filename: filename.to_string(),
+            mime_type: mime_type.clone(),
+            sha256: artifacts::sha256_hex(&data),
+            indexable_content: artifacts::extract_indexable_content(&mime_type, &data),
+            data,
+        });
+    }
+    Ok(prepared)
+}
 
 /// Mount the memory router with the full set of CRUD, search, recall, tag, profile, and version-chain routes.
 pub fn router() -> Router<AppState> {
@@ -123,7 +193,7 @@ async fn store_memory(
     let brain_category = req.category.clone();
     let brain_source = req.source.clone();
     let brain_importance = req.importance as f64;
-    let inline_artifacts = req.artifacts.take();
+    let inline_artifacts = prepare_inline_artifacts(req.artifacts.take())?;
     let embedder = state.current_embedder().await;
     let pre_embedded = req.embedding.is_some();
     let result = if let Some(ref e) = embedder {
@@ -132,78 +202,56 @@ async fn store_memory(
         memory::store(&db, req, None, false).await?
     };
     let embedded = pre_embedded || embedder.is_some();
+    let attachment_memory_id = result.duplicate_of.unwrap_or(result.id);
+    let (artifact_summaries, artifact_error) = if inline_artifacts.is_empty() {
+        (Vec::new(), None)
+    } else {
+        match artifacts::store_inline_batch(
+            &db,
+            auth.effective_user_id(),
+            attachment_memory_id,
+            &inline_artifacts,
+        )
+        .await
+        {
+            Ok(summaries) => (summaries, None),
+            Err(error) => {
+                tracing::error!(
+                    memory_id = attachment_memory_id,
+                    error = %error,
+                    "memory persisted but inline artifact batch failed"
+                );
+                (
+                    Vec::new(),
+                    Some("memory persisted but attachments were not committed"),
+                )
+            }
+        }
+    };
     if let Some(existing_id) = result.duplicate_of {
+        if let Some(error) = artifact_error {
+            return Ok((
+                StatusCode::MULTI_STATUS,
+                Json(json!({
+                    "stored": false,
+                    "duplicate": true,
+                    "id": existing_id,
+                    "existing_id": existing_id,
+                    "attachments_committed": false,
+                    "error": error,
+                })),
+            ));
+        }
         return Ok((
             StatusCode::OK,
             Json(json!({
                 "stored": false, "duplicate": true,
                 "existing_id": existing_id, "boosted": true,
                 "distance": Value::Null,
+                "attachments_committed": true,
+                "artifacts": artifact_summaries,
             })),
         ));
-    }
-
-    // Process inline artifact attachments (max 10 per store call).
-    let mut artifact_summaries: Vec<ArtifactSummary> = Vec::new();
-    if let Some(ref inline_arts) = inline_artifacts {
-        if inline_arts.len() > 10 {
-            return Err(AppError(kleos_lib::EngError::InvalidInput(
-                "at most 10 inline artifacts per store call".into(),
-            )));
-        }
-        for art in inline_arts {
-            if art.filename.is_empty() {
-                return Err(AppError(kleos_lib::EngError::InvalidInput(
-                    "inline artifact filename must not be empty".into(),
-                )));
-            }
-            if art.data_base64.is_empty() {
-                return Err(AppError(kleos_lib::EngError::InvalidInput(
-                    "inline artifact data_base64 must not be empty".into(),
-                )));
-            }
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(&art.data_base64)
-                .map_err(|e| {
-                    AppError(kleos_lib::EngError::InvalidInput(format!(
-                        "invalid base64 in artifact '{}': {e}",
-                        art.filename
-                    )))
-                })?;
-            let mime = art
-                .mime_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let size_bytes = data.len() as i64;
-            let sha256 = artifacts::sha256_hex(&data);
-            let indexable_content = artifacts::extract_indexable_content(&mime, &data);
-            let opts = StoreArtifactOpts {
-                content: indexable_content,
-                ..StoreArtifactOpts::default()
-            };
-            let art_id = artifacts::store_artifact(
-                &db,
-                auth.effective_user_id(),
-                result.id,
-                &art.filename,
-                &art.filename,
-                &mime,
-                size_bytes,
-                &sha256,
-                "inline",
-                Some(data),
-                None,
-                false,
-                &opts,
-            )
-            .await?;
-            artifact_summaries.push(ArtifactSummary {
-                id: art_id,
-                filename: art.filename.clone(),
-                mime_type: mime,
-                size_bytes,
-            });
-        }
     }
 
     // Derive facts, entity links, and brain associations from the new memory --
@@ -225,6 +273,19 @@ async fn store_memory(
         .await;
     }
 
+    if let Some(error) = artifact_error {
+        return Ok((
+            StatusCode::MULTI_STATUS,
+            Json(json!({
+                "stored": true,
+                "duplicate": false,
+                "id": result.id,
+                "attachments_committed": false,
+                "error": error,
+            })),
+        ));
+    }
+
     let mem = memory::get(&db, result.id, auth.effective_user_id()).await?;
     let mut response = json!({
         "stored": true, "id": result.id, "created_at": mem.created_at,
@@ -234,6 +295,7 @@ async fn store_memory(
     });
     if !artifact_summaries.is_empty() {
         response["artifacts"] = json!(artifact_summaries);
+        response["attachments_committed"] = json!(true);
     }
     Ok((StatusCode::CREATED, Json(response)))
 }

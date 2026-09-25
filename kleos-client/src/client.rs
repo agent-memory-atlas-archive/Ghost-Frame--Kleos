@@ -283,6 +283,16 @@ impl Client {
             )
         })?;
         let parsed: Result<Value, _> = serde_json::from_slice(&bytes);
+        if status == reqwest::StatusCode::MULTI_STATUS {
+            // Preserve the complete result so partial memory/import writes can
+            // be recovered by ID and counts without automatically replaying them.
+            return Err(format!(
+                "HTTP {} {}: partial persistence; response: {}",
+                status,
+                url,
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
         if status.is_success() {
             parsed.or_else(|_| {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -587,6 +597,29 @@ pub fn truncate(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An HTTP 207 response is an error with recovery identity, without replay.
+    #[tokio::test]
+    async fn partial_persistence_retains_response_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = json!({"id": 123, "stored": true, "attachments_committed": false, "error": "attachment batch failed"}).to_string();
+        let expected = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _bytes_read = socket.read(&mut request).await.unwrap();
+            let response = format!("HTTP/1.1 207 Multi-Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = Client::new(format!("http://{address}"), None, None);
+        let result = client.post("/memory", json!({"content": "partial"})).await;
+        server.await.unwrap();
+        let error = result.expect_err("partial persistence must not report success");
+        assert!(error.contains("207"), "{error}");
+        assert!(error.contains(&expected), "{error}");
+    }
 
     /// A single configured URL must keep the caller's whole budget: there is no
     /// second attempt to reserve time for.

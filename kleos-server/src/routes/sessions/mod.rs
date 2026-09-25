@@ -1,3 +1,5 @@
+//! Admits owner-scoped sessions and serves their output streams.
+
 use axum::{
     extract::ws::{Message, WebSocket},
     extract::{Path, Query, State, WebSocketUpgrade},
@@ -17,9 +19,11 @@ use kleos_lib::sessions::{
     SessionCreateRequest,
 };
 
+/// Defines request parameters for session output and pagination.
 mod types;
 use types::{AppendBody, ListSessionsParams};
 
+/// Registers session creation, retrieval, output, and stream routes.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -31,18 +35,17 @@ pub fn router() -> Router<AppState> {
         .route("/sessions/{id}/stream", get(stream_handler))
 }
 
+/// Admits a session within owner capacity and installs its broadcast channel.
 async fn create_session_handler(
     State(state): State<AppState>,
     ResolvedDb(db): ResolvedDb,
     Auth(auth): Auth,
     Json(body): Json<SessionCreateRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    let session = create_session(&db, &body, auth.effective_user_id()).await?;
-
     // SECURITY (SEC-H4): enforce per-tenant session count limit to prevent
     // unbounded HashMap growth from a single API key creating sessions in a loop.
     const MAX_SESSIONS_PER_USER: usize = 64;
-    {
+    let session = {
         let mut sessions = state.sessions.write().await;
         let count = sessions
             .keys()
@@ -54,15 +57,20 @@ async fn create_session_handler(
                 MAX_SESSIONS_PER_USER
             ))));
         }
+        // Keep admission serialized through persistence. Releasing the lock
+        // between the count and write would admit two callers into one slot.
+        let session = create_session(&db, &body, auth.effective_user_id()).await?;
         sessions.insert(
             (auth.effective_user_id(), session.id.clone()),
             Arc::new(tokio::sync::Mutex::new(SessionBroadcast::new())),
         );
-    }
+        session
+    };
 
     Ok((StatusCode::CREATED, Json(json!(session))))
 }
 
+/// Lists the authenticated owner's persisted sessions.
 async fn list_sessions_handler(
     ResolvedDb(db): ResolvedDb,
     Auth(auth): Auth,
@@ -75,6 +83,7 @@ async fn list_sessions_handler(
     ))
 }
 
+/// Returns an owned session and its buffered database output.
 async fn get_session_handler(
     ResolvedDb(db): ResolvedDb,
     Auth(auth): Auth,
@@ -85,6 +94,7 @@ async fn get_session_handler(
     Ok(Json(json!({ "session": session, "output": output })))
 }
 
+/// Appends bounded output to an owned session and broadcasts it.
 async fn append_handler(
     State(state): State<AppState>,
     ResolvedDb(db): ResolvedDb,
@@ -126,6 +136,7 @@ async fn append_handler(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Upgrades the connection to an owner-scoped session stream.
 async fn stream_handler(
     State(state): State<AppState>,
     ResolvedDb(db): ResolvedDb,
@@ -136,6 +147,7 @@ async fn stream_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state, db, id, auth.effective_user_id()))
 }
 
+/// Streams authorized session output with idle and lifetime bounds.
 async fn handle_ws(
     mut socket: WebSocket,
     state: AppState,

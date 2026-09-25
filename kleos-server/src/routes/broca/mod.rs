@@ -1,13 +1,13 @@
-//! Broca routes: action logging, feed, stats, LLM narration, and unauthenticated
+//! Broca routes: action logging, feed, stats, LLM narration, and authenticated
 //! Axon ingest.
 //!
 //! The authenticated handlers (`/broca/actions`, `/broca/feed`, `/broca/stats`,
 //! `/broca/actions/{id}/narrate`, `/broca/narrate`) are mounted inside the auth
-//! middleware stack via [`router`]. The webhook receiver (`/broca/ingest`) is
-//! mounted outside auth via [`ingest_router`] and uses the system tenant shard
-//! (user_id=1) for storage.
+//! middleware stack via [`router`]. The webhook receiver (`/broca/ingest`) uses
+//! the authenticated caller's effective tenant; the public router serves only
+//! the static dashboard shell.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 const DASHBOARD_HTML: &str = include_str!("ui.html");
 
 use crate::error::AppError;
-use crate::extractors::{resolve_db_for_user, Auth, ResolvedDb};
+use crate::extractors::{Auth, ResolvedDb};
 use crate::state::AppState;
 use kleos_lib::services::broca::{
     ask as broca_ask, get_action, get_or_narrate_action, get_stats as get_broca_stats, log_action,
@@ -45,19 +45,15 @@ pub fn router() -> Router<AppState> {
         .route("/broca/feed", get(get_feed_handler))
         .route("/broca/stats", get(get_stats))
         .route("/broca/ask", post(ask_handler))
+        .route("/broca/ingest", post(ingest_handler))
 }
 
-/// Unauthenticated router: mounts `/broca/ingest` and the browser dashboard
-/// at `GET /broca/` outside the auth middleware. The dashboard JS hits the
-/// authenticated `/broca/ask` and `/broca/feed` endpoints separately, so
-/// browser-side auth still applies to its data calls.
+/// Public router for the static browser dashboard shell.
 ///
-/// Mount this via `public_routes` in `server.rs` so the routes do not pass
-/// through `auth_middleware`. Network-layer controls (firewall, reverse-proxy
-/// allowlist) are the recommended protection surface.
+/// Its JavaScript calls authenticated data endpoints separately, so serving
+/// the shell publicly does not expose tenant data or mutation endpoints.
 pub fn ingest_router() -> Router<AppState> {
     Router::new()
-        .route("/broca/ingest", post(ingest_handler))
         .route("/broca/", get(dashboard_handler))
         .route("/broca", get(dashboard_handler))
 }
@@ -291,15 +287,14 @@ async fn ask_handler(
     Ok(Json(json!(result)))
 }
 
-/// Handler for `POST /broca/ingest`. Intentionally unauthenticated; receives
-/// webhook events from Axon and persists them as broca actions in the system
-/// tenant shard (user_id=1) with the matching template-rendered narrative.
+/// Handler for `POST /broca/ingest`.
 ///
-/// `source` and `type` are required. The upstream Axon event id is stored in
-/// `axon_event_id` for correlation. Protect this endpoint at the network layer
-/// (firewall, reverse-proxy allowlist) rather than with bearer tokens.
+/// The authenticated actor selects the effective tenant. `source` remains
+/// claimed event metadata and never changes authorization. The upstream Axon
+/// event id is stored in `axon_event_id` for correlation.
 async fn ingest_handler(
-    State(state): State<AppState>,
+    Auth(auth): Auth,
+    ResolvedDb(db): ResolvedDb,
     Json(body): Json<IngestBody>,
 ) -> Result<Json<Value>, AppError> {
     if body.source.is_empty() {
@@ -312,10 +307,6 @@ async fn ingest_handler(
             "type is required".into(),
         )));
     }
-
-    // System user shard: webhook ingestion is not tied to a specific tenant.
-    // user_id=1 is the operator/system tenant.
-    let db = resolve_db_for_user(&state, 1).await?;
 
     let payload = body
         .payload
@@ -335,7 +326,7 @@ async fn ingest_handler(
         narrative,
         payload: Some(payload),
         axon_event_id: body.id,
-        user_id: Some(1),
+        user_id: Some(auth.effective_user_id()),
     };
 
     let entry = log_action(&db, req).await?;

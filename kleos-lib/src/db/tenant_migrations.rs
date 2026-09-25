@@ -1982,7 +1982,7 @@ fn apply_schema_v70_tenant_state(conn: &Connection) -> Result<()> {
     // is_latest = 1 so we only count the current version of each memory.
     let (bytes, count): (i64, i64) = conn
         .query_row(
-            "SELECT COALESCE(SUM(length(content)), 0), COUNT(*)
+            "SELECT COALESCE(SUM(length(CAST(content AS BLOB))), 0), COUNT(*)
              FROM memories WHERE is_latest = 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),

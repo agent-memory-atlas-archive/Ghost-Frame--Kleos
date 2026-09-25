@@ -146,6 +146,10 @@ pub struct AuthContext {
     /// session can never manage another user's account. Only tenant DATA
     /// operations follow the delegation, via `effective_user_id()`.
     pub act_as: Option<i64>,
+    /// Effective whole-instance grant carried into middleware-free MCP tool
+    /// dispatch. `None` means the request is not delegated; Admin delegation
+    /// records `Write` because it may perform either logical operation.
+    pub act_as_access: Option<crate::spaces::InstanceAccess>,
     pub identity: Option<IdentityCtx>,
 }
 
@@ -531,6 +535,7 @@ pub async fn validate_key(db: &Database, raw_key: &str) -> Result<AuthContext> {
         key: api_key,
         user_id,
         act_as: None,
+        act_as_access: None,
         identity: None,
     })
 }

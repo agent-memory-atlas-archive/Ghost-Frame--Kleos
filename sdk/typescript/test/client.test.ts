@@ -1,3 +1,4 @@
+/** Client request and response contracts verified through isolated fetch stubs. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EngramClient, EngramError } from '../src/index.js';
 
@@ -20,6 +21,16 @@ describe('EngramClient', () => {
   });
 
   describe('store', () => {
+    // A persisted memory with failed attachments must expose its retry identity.
+    it('rejects partial persistence while retaining the full response', async () => {
+      const partial = { id: 123, stored: true, attachments_committed: false, error: 'attachment batch failed' };
+      mockFetch.mockResolvedValueOnce({ ok: true, status: 207, json: async () => partial });
+      await expect(client.store({ content: 'partial memory' })).rejects.toMatchObject({
+        name: 'EngramError', statusCode: 207, response: partial,
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
     it('should store a memory', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,

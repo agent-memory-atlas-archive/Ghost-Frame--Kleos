@@ -3,9 +3,13 @@
  *
  * Type definitions matching the engram-server API.
  */
+/** Supported memory categories. */
 export type MemoryCategory = 'task' | 'discovery' | 'decision' | 'state' | 'issue' | 'general' | 'reference';
+/** Question types for search optimization. */
 export type QuestionType = 'fact_recall' | 'preference' | 'reasoning' | 'generalization' | 'temporal';
+/** Retrieval engines available to search requests. */
 export type SearchMode = 'hybrid' | 'vector' | 'fts';
+/** Review status of a stored memory. */
 export type MemoryStatus = 'approved' | 'pending';
 /**
  * A stored memory record.
@@ -160,7 +164,9 @@ export interface UpdateRequest {
     is_static?: boolean;
     is_fact?: boolean;
 }
+/** Ranking strategy used to assemble memory context. */
 export type ContextStrategy = 'semantic' | 'temporal' | 'importance' | 'mixed';
+/** Breadth of memory context to assemble for a request. */
 export type ContextMode = 'default' | 'focused' | 'broad';
 /**
  * Request to assemble context for a prompt.
@@ -206,6 +212,8 @@ export interface EngramClientConfig {
  */
 export interface ApiError {
     error: string;
+    /** Preserve partial results, including persisted IDs and attachment state. */
+    [key: string]: unknown;
 }
 /**
  * Custom error class for Engram API errors.
@@ -213,6 +221,7 @@ export interface ApiError {
 export declare class EngramError extends Error {
     statusCode: number;
     response?: ApiError | undefined;
+    /** Retain status and complete response details so callers can recover partial writes. */
     constructor(message: string, statusCode: number, response?: ApiError | undefined);
 }
 //# sourceMappingURL=types.d.ts.map
